@@ -136,7 +136,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"connected": False, **conf_fields})
                 return
             since = os.path.getmtime(NAME_FILE)
-            r_name = subprocess.run(["sudo", "-n", "cat", NAME_FILE], capture_output=True, text=True)
+            r_name = subprocess.run(["sudo", "-n", "/bin/cat", NAME_FILE], capture_output=True, text=True)
             iface = r_name.stdout.strip() if r_name.returncode == 0 else ""
             r = subprocess.run(["sudo", "-n", WG, "show", "all", "dump"], capture_output=True, text=True)
             if r.returncode != 0:

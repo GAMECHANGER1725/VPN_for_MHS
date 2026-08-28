@@ -248,26 +248,48 @@ async function refreshState() {
   }
 }
 
+async function fetchWithTimeout(url, ms) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ms);
+  try {
+    const r = await fetch(url, { cache: 'no-store', signal: controller.signal });
+    return await r.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Two independent providers, tried in order — a slow or down provider
+// falls through to the next rather than leaving the panel stuck.
+const IP_PROVIDERS = [
+  async () => {
+    const j = await fetchWithTimeout('https://ipwho.is/', 3500);
+    return { ip: j.ip, isp: j.connection && j.connection.isp, loc: [j.city, j.region, j.country] };
+  },
+  async () => {
+    const j = await fetchWithTimeout('https://ipapi.co/json/', 3500);
+    return { ip: j.ip, isp: j.org, loc: [j.city, j.region, j.country_name] };
+  },
+];
+
 async function refreshIp() {
   const btn = document.querySelector('.refresh-btn');
   btn.innerHTML = '<span class="spin">↻</span> refresh';
   document.getElementById('ipIsp').textContent = 'looking up...';
   document.getElementById('ipLoc').textContent = 'looking up...';
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4000);
-  try {
-    // ipwho.is: fast, HTTPS, no API key, no rate-limit auth needed.
-    const r = await fetch('https://ipwho.is/', { cache: 'no-store', signal: controller.signal });
-    const j = await r.json();
-    document.getElementById('ipBig').textContent = j.ip || '—';
-    document.getElementById('ipIsp').textContent = (j.connection && j.connection.isp) || '—';
-    document.getElementById('ipLoc').textContent = [j.city, j.region, j.country].filter(Boolean).join(', ') || '—';
-  } catch (e) {
-    document.getElementById('ipIsp').textContent = e.name === 'AbortError' ? 'lookup timed out' : 'lookup failed';
+  let result = null, lastErr = null;
+  for (const provider of IP_PROVIDERS) {
+    try { result = await provider(); break; } catch (e) { lastErr = e; }
+  }
+
+  if (result) {
+    document.getElementById('ipBig').textContent = result.ip || '—';
+    document.getElementById('ipIsp').textContent = result.isp || '—';
+    document.getElementById('ipLoc').textContent = result.loc.filter(Boolean).join(', ') || '—';
+  } else {
+    document.getElementById('ipIsp').textContent = (lastErr && lastErr.name === 'AbortError') ? 'all lookups timed out' : 'lookup failed';
     document.getElementById('ipLoc').textContent = '—';
-  } finally {
-    clearTimeout(timeout);
   }
   btn.innerHTML = '↻ refresh';
 }
