@@ -22,11 +22,16 @@ done
 
 if command -v python3 >/dev/null 2>&1; then
   printf '\n=== python syntax ===\n'
-  if python3 -c "import ast,sys; ast.parse(open('$DIR/../bin/upnp-wan-ip.py').read())" 2>/dev/null; then
-    printf '  ok   upnp-wan-ip.py\n'
-  else
-    printf '  FAIL upnp-wan-ip.py\n'; RC=1
-  fi
+  for PY in upnp-wan-ip.py stun-probe.py; do
+    if python3 -c "import ast; ast.parse(open('$DIR/../bin/$PY').read())" 2>/dev/null; then
+      printf '  ok   %s\n' "$PY"
+    else
+      printf '  FAIL %s\n' "$PY"; RC=1
+    fi
+  done
+
+  printf '\n=== test-stun.py ===\n'
+  python3 "$DIR/test-stun.py" || RC=1
 fi
 
 if command -v shellcheck >/dev/null 2>&1; then

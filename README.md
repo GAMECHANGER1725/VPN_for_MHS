@@ -65,12 +65,28 @@ before sharing.
 | `--json` | Machine-readable report on stdout |
 | `--save` | Write JSON to `reports/` (gitignored, mode 600) |
 | `--with-sudo` | Also inspect pf ruleset (read-only, prompts for password) |
+| `--client-check` | Can a WireGuard *client* work on the network you're on right now? Fast, no sudo. |
 | `--offline` | Make **zero** external network requests |
 | `--fast` | Skip traceroute and `system_profiler` |
 | `--no-color` | Plain output |
 
 Exit codes: `0` clean, `1` one or more BLOCK findings, `2` bad usage,
 `3` not macOS.
+
+### Checking a network you're standing on
+
+The audit above profiles the machine that will *host* the server. A different
+question — "can a WireGuard client connect from this café / school / hotel?" —
+gets its own fast check:
+
+```sh
+bin/vpn-doctor --client-check
+```
+
+One STUN round trip decides it. WireGuard is UDP-only, so a client works from a
+network if and only if that network passes arbitrary outbound UDP. Run it
+wherever you plan to connect from. [docs/networks.md](docs/networks.md) covers
+what to expect by network type.
 
 ### What it sends off-machine
 
@@ -85,6 +101,7 @@ determine whether you are reachable from the Internet:
 | IPv6 reachability | ICMP to `2606:4700:4700::1111` | `PING6_TARGET` |
 | NAT depth | `traceroute` to `1.1.1.1` | `TRACE_TARGET` |
 | DNS resolution | A-record for `example.com` | `DNS_TEST_NAME` |
+| Outbound UDP (STUN) | `stun.l.google.com:19302` | `STUN_SERVER` |
 | Router WAN address | UPnP SSDP + SOAP, **LAN only** | — |
 
 `--offline` skips all of them, at the cost of being unable to classify your
@@ -164,13 +181,16 @@ Draft design and the decision points that depend on your audit result:
 bin/
   vpn-doctor         Phase 1 environment audit (read-only)
   upnp-wan-ip.py     Router WAN address query via UPnP IGD (read-only)
+  stun-probe.py      Outbound-UDP test via STUN (read-only)
 tests/
   run-all.sh         Run every suite + syntax + shellcheck
+  test-stun.py       STUN message parser
   test-primitives.sh Address/CIDR arithmetic
   test-cgnat.sh      CGNAT classification scenarios
   test-ownership.sh  Managed-network detection, NAT typing
   test-report.sh     JSON report emitter
 docs/
+  networks.md        Which networks a client can connect from, and why
   reconnaissance.md  What the audit checks and how to read it
   architecture.md    Draft design, pending audit results
   limitations.md     What this cannot do, stated plainly
@@ -183,7 +203,7 @@ reports/            Audit output (gitignored)
 bash tests/run-all.sh
 ```
 
-102 assertions across four suites, plus syntax checks and shellcheck:
+126 assertions across five suites, plus syntax checks and shellcheck:
 
 | Suite | Covers |
 |---|---|
@@ -191,12 +211,14 @@ bash tests/run-all.sh
 | `test-cgnat.sh` | The CGNAT classifier against realistic topologies: single-NAT home broadband, confirmed CGNAT via three different signals, double NAT, no NAT, insufficient evidence, `100.64.0.0/10` boundaries, and state leakage between runs |
 | `test-ownership.sh` | Whether the network is one you administer, and the split between carrier-grade NAT and multi-layer private NAT — including a regression case built from a real institutional network the tool originally misread |
 | `test-report.sh` | JSON emitter — empty report, facts, findings, and hostile content (embedded quotes, backslashes, newlines, tabs) validated by a real JSON parser |
+| `test-stun.py` | STUN message construction and parsing, including malformed attributes |
 
 These functions decide whether the tool tells you "port forwarding will work"
-or "port forwarding cannot possibly work". Being wrong in either direction
-costs hours, so they are tested rather than trusted. All are pure bash and run
-on any platform, which is why they could be verified here even though the audit
-itself cannot.
+or "port forwarding cannot possibly work", and whether a given network will
+carry WireGuard at all. Being wrong in either direction costs hours, so they
+are tested rather than trusted. All are pure bash or pure Python with no
+network dependency, which is why they can be verified anywhere even though the
+audit itself only runs on macOS.
 
 ## Secrets
 
@@ -208,7 +230,7 @@ key will ever be committed, logged, or printed unless you explicitly export it.
 
 | Phase | | |
 |---|---|---|
-| 1 | Reconnaissance | **instrument ready — awaiting your audit** |
+| 1 | Reconnaissance | instrument ready; **first real audit ran on a managed network — needs a re-run at home** |
 | 2 | Architecture | draft, blocked on Phase 1 result |
 | 3 | Minimal working VPN, one client | not started |
 | 4 | Routing / NAT | not started |

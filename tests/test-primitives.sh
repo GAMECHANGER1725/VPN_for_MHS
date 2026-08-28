@@ -107,6 +107,26 @@ assert_eq "backslash"    'a\\b'           "$(json_escape 'a\b')"
 assert_eq "tab"          'a\tb'           "$(json_escape "$(printf 'a\tb')")"
 
 echo
+echo "probe_udp_egress — degrades safely when it cannot run"
+probe_udp_egress "" "/nonexistent"
+assert_eq "no python3 -> not tested (-1), not 'blocked'" "-1" "$UDP_EGRESS"
+assert_eq "no python3 -> no mapped address invented" "" "$UDP_MAPPED"
+
+probe_udp_egress "/usr/bin/python3" "/nonexistent/dir"
+assert_eq "missing stun-probe.py -> not tested (-1)" "-1" "$UDP_EGRESS"
+assert_eq "missing stun-probe.py -> no mapped address" "" "$UDP_MAPPED"
+
+# The distinction matters: -1 means "we do not know", 0 means "we tested and
+# UDP is blocked". Collapsing them would tell someone their network blocks
+# WireGuard when we simply never checked.
+probe_udp_egress "" ""
+if [ "$UDP_EGRESS" != "0" ]; then
+  ok "'not tested' is never reported as 'blocked'"
+else
+  bad "'not tested' collapsed into 'blocked'"
+fi
+
+echo
 echo "─────────────────────────────────"
 printf 'passed: %d   failed: %d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

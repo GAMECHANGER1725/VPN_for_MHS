@@ -19,6 +19,9 @@
 #   bin/vpn-doctor --save               write report to reports/ (gitignored)
 #   bin/vpn-doctor --with-sudo          also inspect pf (prompts for password)
 #   bin/vpn-doctor --offline            no external network requests
+#   bin/vpn-doctor --client-check       can a WireGuard CLIENT reach a server
+#                                       from THIS network? Fast, no sudo. Run
+#                                       it on every network you want to use.
 #   bin/vpn-doctor --fast               skip slow probes (traceroute, profiler)
 #
 set -uo pipefail
@@ -34,6 +37,7 @@ VERSION="0.1.0-phase1"
 : "${PING6_TARGET:=2606:4700:4700::1111}"
 : "${TRACE_TARGET:=1.1.1.1}"
 : "${DNS_TEST_NAME:=example.com}"
+: "${STUN_SERVER:=stun.l.google.com:19302}"
 
 # --------------------------------------------------------------------------
 # Options
@@ -44,6 +48,7 @@ OPT_SUDO=0
 OPT_OFFLINE=0
 OPT_FAST=0
 OPT_NOCOLOR=0
+OPT_CLIENT_CHECK=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -53,6 +58,7 @@ while [ $# -gt 0 ]; do
     --offline)   OPT_OFFLINE=1 ;;
     --fast)      OPT_FAST=1 ;;
     --no-color)  OPT_NOCOLOR=1 ;;
+    --client-check) OPT_CLIENT_CHECK=1 ;;
     -h|--help)
       sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -62,6 +68,8 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --------------------------------------------------------------------------
 # Output helpers
@@ -204,6 +212,29 @@ cidr_overlap() {  # cidr_overlap <a> <b>
   ai=$(ip4_to_int "$an") || return 1
   bi=$(ip4_to_int "$bn") || return 1
   [ $(( ai & m )) -eq $(( bi & m )) ]
+}
+
+# --------------------------------------------------------------------------
+# probe_udp_egress — does this network permit arbitrary outbound UDP?
+#
+# Sets: UDP_EGRESS   1 permitted | 0 blocked | -1 not tested
+#       UDP_MAPPED   "ip:port" the STUN server saw us from, when permitted
+#
+# This is the single fact that decides whether a WireGuard *client* can work on
+# a given network. WireGuard is UDP-only; no port choice rescues it on a network
+# that drops UDP. A STUN binding request is used because a completed round trip
+# proves both that the datagram left and that the reply came back, on a port
+# that is not DNS — which many networks special-case.
+# --------------------------------------------------------------------------
+probe_udp_egress() {
+  local py="${1:-}" script_dir="${2:-}"
+  UDP_EGRESS=-1
+  UDP_MAPPED=""
+  [ -n "$py" ] || return 0
+  [ -f "$script_dir/stun-probe.py" ] || return 0
+
+  UDP_MAPPED="$("$py" "$script_dir/stun-probe.py" --server "$STUN_SERVER" --timeout 4 2>/dev/null)"
+  if [ -n "$UDP_MAPPED" ]; then UDP_EGRESS=1; else UDP_EGRESS=0; fi
 }
 
 # --------------------------------------------------------------------------
@@ -409,6 +440,126 @@ looks real and is not, which defeats the purpose.
 Run this on the MacBook Air M2 that is intended to be the VPN server.
 EOF
   exit 3
+fi
+
+# ==========================================================================
+# CLIENT CHECK MODE
+#   "Can a WireGuard client reach my server from THIS network?"
+#
+#   Deliberately separate from the full audit. The full audit profiles the
+#   machine that will host the server. This answers a different question about
+#   whatever network you happen to be standing on, so it is fast, needs no
+#   sudo, and is meant to be run repeatedly — at school, at a friend's house,
+#   on hotel wifi, on cellular.
+# ==========================================================================
+run_client_check() {
+  local py; py="$(command -v python3 2>/dev/null)"
+
+  say "${C_B}vpn-doctor --client-check${C_RST} ${C_DIM}v${VERSION}${C_RST}"
+  say "${C_DIM}Can a WireGuard client get out of this network?${C_RST}"
+  say ""
+
+  # --- which network are we on -------------------------------------------
+  local def4 gw4 pif svc lan4 ssid
+  def4="$(route -n get default 2>/dev/null)"
+  gw4="$(printf '%s' "$def4"  | awk -F': *' '/gateway:/{print $2; exit}')"
+  pif="$(printf '%s' "$def4"  | awk -F': *' '/interface:/{print $2; exit}')"
+  [ -n "$pif" ] && lan4="$(ipconfig getifaddr "$pif" 2>/dev/null)"
+  svc="$(networksetup -listnetworkserviceorder 2>/dev/null | awk -v dev="${pif:-none}" '
+    /^\([0-9*]+\)/ { s=$0; sub(/^\([0-9*]+\) /,"",s); next }
+    /Device: / { d=$0; sub(/.*Device: /,"",d); sub(/\).*/,"",d); if (d==dev) { print s; exit } }')"
+  ssid="$(ipconfig getsummary "${pif:-en0}" 2>/dev/null | awk -F' : ' '/ SSID/{print $2; exit}')"
+
+  hdr "NETWORK"
+  kv "Interface"   "${pif:-NONE}${svc:+  ($svc)}"
+  [ -n "${ssid:-}" ] && kv "SSID" "$ssid"
+  kv "Local address" "${lan4:-NONE}"
+  kv "Gateway"       "${gw4:-NONE}"
+
+  if [ -z "$pif" ]; then
+    say ""
+    say "  ${C_RED}No default route. This machine is not on a network.${C_RST}"
+    return 1
+  fi
+
+  # --- the three probes that matter ---------------------------------------
+  hdr "EGRESS PROBES"
+
+  local https_ok=0 dns_ok=0
+  if have curl && curl -4 -s -o /dev/null --max-time 6 "$IPV4_ECHO_URL"; then https_ok=1; fi
+  kv "HTTPS (TCP 443)"  "$([ $https_ok -eq 1 ] && echo PERMITTED || echo BLOCKED)"
+
+  # DNS over UDP/53 to an external resolver. Many restrictive networks allow
+  # this one UDP port and nothing else, so passing here does NOT imply
+  # WireGuard will work — which is exactly why the STUN probe exists.
+  if have dig && [ -n "$(dig +short +time=3 +tries=1 "@$PING4_TARGET" "$DNS_TEST_NAME" A 2>/dev/null | head -1)" ]; then
+    dns_ok=1
+  fi
+  kv "DNS (UDP 53)"     "$([ $dns_ok -eq 1 ] && echo PERMITTED || echo "BLOCKED or redirected")"
+
+  probe_udp_egress "$py" "$SCRIPT_DIR"
+  case "$UDP_EGRESS" in
+    1) kv "Arbitrary UDP"  "PERMITTED — mapped to $UDP_MAPPED" ;;
+    0) kv "Arbitrary UDP"  "BLOCKED" ;;
+    *) kv "Arbitrary UDP"  "NOT TESTED (python3 unavailable)" ;;
+  esac
+
+  fact schema_version "1"
+  fact doctor_version "$VERSION"
+  fact generated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  fact mode "client-check"
+  fact client_check "1"
+  fact client_interface "$pif"
+  fact client_ssid "${ssid:-}"
+  fact client_https "$https_ok"
+  fact client_dns_udp "$dns_ok"
+  fact udp_egress "$UDP_EGRESS"
+  fact udp_mapped "$UDP_MAPPED"
+
+  # --- verdict -------------------------------------------------------------
+  hdr "VERDICT FOR A WIREGUARD CLIENT"
+  say ""
+  case "$UDP_EGRESS" in
+    1)
+      say "  ${C_B}${C_GRN}LIKELY WORKS${C_RST}"
+      say ""
+      say "  This network let a UDP datagram out to an arbitrary port and let the"
+      say "  reply back in. That is what WireGuard needs. Remaining unknowns are"
+      say "  on the server side, not here."
+      note ""
+      note "Not a guarantee: the probe used UDP ${STUN_SERVER##*:}. A network could still"
+      note "block your specific WireGuard port. If it fails, try a different port"
+      note "before concluding the network is the problem."
+      ;;
+    0)
+      say "  ${C_B}${C_RED}WILL NOT WORK${C_RST}"
+      say ""
+      say "  No UDP reply came back. WireGuard is UDP-only, so no choice of port"
+      say "  or server configuration makes it work from this network."
+      say ""
+      say "  ${C_DIM}This is a property of THIS network, not of your server.${C_RST}"
+      note ""
+      note "If DNS over UDP 53 passed but arbitrary UDP did not, the network is"
+      note "selectively permitting UDP rather than blocking it wholesale."
+      note "docs/networks.md covers what is and is not possible from here."
+      ;;
+    *)
+      say "  ${C_B}UNKNOWN${C_RST}"
+      say ""
+      say "  The UDP probe could not run, so the question is unanswered."
+      say "  python3 is required for this check."
+      ;;
+  esac
+  say ""
+
+  [ "$OPT_JSON" -eq 1 ] && emit_json
+  [ "$UDP_EGRESS" = "0" ] && return 1
+  return 0
+}
+
+if [ "$OPT_CLIENT_CHECK" -eq 1 ]; then
+  run_client_check
+  exit $?
 fi
 
 say "${C_B}vpn-doctor${C_RST} ${C_DIM}v${VERSION}${C_RST}  ${C_DIM}(read-only; modifies nothing)${C_RST}"
@@ -764,6 +915,7 @@ ping6t() {
 }
 
 GW_REACHABLE=0; ICMP4_OK=0; ICMP6_OK=0; HTTPS_OK=0; NET4_OK=0
+UDP_EGRESS=-1; UDP_MAPPED=""
 
 if [ "$OPT_OFFLINE" -eq 0 ]; then
   [ -n "$GW4" ] && { ping4 "$GW4" && GW_REACHABLE=1; }
@@ -788,6 +940,13 @@ if [ "$OPT_OFFLINE" -eq 0 ]; then
   kv "IPv4 Internet"      "$V4_DETAIL"
   kv "IPv6 Internet"      "$([ $ICMP6_OK -eq 1 ] && echo "AVAILABLE (icmp $PING6_TARGET)" || echo "UNAVAILABLE")"
   kv "HTTPS egress"       "$([ $HTTPS_OK  -eq 1 ] && echo OK || echo FAILED)"
+
+  probe_udp_egress "$PY3_BIN" "$SCRIPT_DIR"
+  case "$UDP_EGRESS" in
+    1) kv "Outbound UDP"  "PERMITTED — this network mapped us to $UDP_MAPPED" ;;
+    0) kv "Outbound UDP"  "BLOCKED or filtered (no STUN reply)" ;;
+    *) kv "Outbound UDP"  "NOT TESTED (python3 or stun-probe.py unavailable)" ;;
+  esac
 else
   kv "All probes"         "SKIPPED (offline)"
 fi
@@ -799,11 +958,19 @@ fact ipv4_internet "$NET4_OK"
 fact icmp4_ok "$ICMP4_OK"
 fact ipv6_internet "$NET6_OK"
 fact https_egress "$HTTPS_OK"
+fact udp_egress "$UDP_EGRESS"
+fact udp_mapped "$UDP_MAPPED"
 
 if [ "$OPT_OFFLINE" -eq 0 ] && [ "$NET4_OK" -eq 0 ]; then
   finding BLOCK NO_INTERNET \
     "No IPv4 Internet connectivity could be confirmed (ICMP and HTTPS both failed)." \
     "Reachability analysis below is unreliable. Fix connectivity and re-run."
+fi
+
+if [ "$UDP_EGRESS" = "0" ]; then
+  finding WARN UDP_BLOCKED \
+    "Arbitrary outbound UDP appears to be blocked on this network." \
+    "WireGuard is UDP-only, so a client cannot connect from here no matter which port you pick. This says nothing about the server's home network — it is a property of the network this run happened on. See docs/networks.md."
 fi
 
 if [ "$OPT_OFFLINE" -eq 0 ] && [ "$ICMP4_OK" -eq 0 ] && [ "$HTTPS_OK" -eq 1 ]; then
@@ -830,7 +997,6 @@ kv "Public IPv4 (observed)" "${PUB4:-UNKNOWN}"
 kv "Public IPv6 (observed)" "${PUB6:-NONE}"
 
 # --- Router's own view of its WAN address (UPnP, best effort) ---------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UPNP_STATUS="not attempted"
 if [ "$OPT_OFFLINE" -eq 0 ] && [ -n "$PY3_BIN" ] && [ -f "$SCRIPT_DIR/upnp-wan-ip.py" ]; then
   ROUTER_WAN="$("$PY3_BIN" "$SCRIPT_DIR/upnp-wan-ip.py" 2>/dev/null | tr -d '[:space:]')"

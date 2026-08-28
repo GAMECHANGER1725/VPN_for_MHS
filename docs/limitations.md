@@ -175,7 +175,35 @@ hiding a dependency.
 
 ---
 
-## 7. What the diagnostic genuinely cannot determine
+## 7. WireGuard is UDP-only, and the server cannot roam
+
+Two client-side constraints that no server configuration changes.
+
+**UDP only.** WireGuard has no TCP mode. A client can connect from a network if
+and only if that network passes arbitrary outbound UDP and lets the replies
+back. Networks that block UDP — commonly schools and universities, some
+corporate networks, occasionally hotels — cannot carry a WireGuard client at
+all. Trying a different UDP port is worth doing and costs nothing, because some
+networks block specific well-known ports rather than UDP wholesale. It does
+nothing where UDP is blocked outright.
+
+Test any network before you rely on it:
+
+```sh
+bin/vpn-doctor --client-check
+```
+
+**The server cannot travel.** Clients reach a server because they know a fixed
+address to send to, and that address belongs to your house — its public IP and
+its port forward. A laptop cannot be both a roaming client and a reachable
+server without a fixed rendezvous point that both ends can reach, which is
+exactly the always-on host with a stable address this project rules out. The
+Mac stays home; your phone and other devices are what move.
+
+[networks.md](networks.md) covers what works where, and the honest options when
+a network won't carry it.
+
+## 8. What the diagnostic genuinely cannot determine
 
 Recorded so no one mistakes silence for a pass:
 
@@ -190,12 +218,16 @@ Recorded so no one mistakes silence for a pass:
 
 ---
 
-## 8. Non-goals, permanently
+## 9. Non-goals, permanently
 
 - Custom cryptography.
 - A custom VPN protocol.
 - Obscurity as a security measure. Changing the UDP port off 51820 reduces log
   noise from mass scanners. It is not a security control and will never be
   described as one.
+- Tooling whose purpose is defeating a network filter. Trying an alternative
+  UDP port is ordinary configuration and is supported. Wrapping the tunnel in
+  TCP to get past a network that deliberately blocks UDP circumvents someone's
+  policy rather than solving a technical problem, and is out of scope.
 - Weakening security to make the setup work. If the secure path is blocked,
   this project reports BLOCKED rather than lowering the bar.
