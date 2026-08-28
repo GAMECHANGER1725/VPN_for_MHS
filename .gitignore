@@ -12,6 +12,7 @@ privatekey
 preshared*
 *.pem
 
+wg-runtime.conf
 # Generated WireGuard configs (contain PrivateKey= lines)
 *.conf
 !**/*.example.conf

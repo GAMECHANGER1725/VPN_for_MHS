@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+#
+# vpn — management CLI for the self-hosted WireGuard VPN.
+#
+#   vpn init                    generate server keys, choose settings, write config
+#   vpn peer add NAME [opts]    provision a client device
+#   vpn peer list               list peers and their status
+#   vpn peer show NAME          show one peer (never prints its private key)
+#   vpn peer export NAME        print the client config (contains secrets)
+#   vpn peer remove NAME        delete a peer and free its address
+#   vpn start | stop | restart  bring the tunnel up / down
+#   vpn status                  server + peer health from live handshakes
+#   vpn doctor                  environment audit (delegates to vpn-doctor)
+#
+# Design: this file is a thin dispatcher. Real logic lives in lib/*.sh so it
+# can be unit tested. Secret material is read only here and in lib/keys.sh,
+# and is passed to renderers by value — it is never written to a log.
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$SELF_DIR/../lib"
+
+# shellcheck source=/dev/null
+. "$LIB_DIR/common.sh"
+. "$LIB_DIR/ipam.sh"
+. "$LIB_DIR/keys.sh"
+. "$LIB_DIR/config.sh"
+. "$LIB_DIR/peers.sh"
+
+VERSION="0.2.0-phase3"
+
+usage() {
+  sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ==========================================================================
+# init
+# ==========================================================================
+cmd_init() {
+  require_macos
+  require_cmd wg wireguard-tools
+
+  local subnet="${VPN_SUBNET:-10.77.0.0/24}" port="${VPN_PORT:-51820}" endpoint="${VPN_ENDPOINT:-}"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --subnet) shift; subnet="$1" ;;
+      --port)   shift; port="$1" ;;
+      --endpoint) shift; endpoint="$1" ;;
+      *) die "init: unknown option '$1'" ;;
+    esac
+    shift
+  done
+
+  if is_initialised; then
+    die_with_action "The VPN is already initialised." \
+      "A server configuration already exists at $VPN_SERVER_CONF." \
+      "Inspect it with 'vpn config show', or remove state with 'vpn uninstall' first."
+  fi
+
+  ensure_state_dirs
+  step "Initialising VPN server"
+  info "  subnet:   $subnet"
+  info "  port:     $port/udp"
+  info "  endpoint: ${endpoint:-<unset — set later with the home public address>}"
+
+  keys_generate server
+  local sip; sip="$(server_address "$subnet")"
+
+  {
+    printf 'SUBNET=%s\n' "$subnet"
+    printf 'SERVER_ADDRESS=%s\n' "$sip"
+    printf 'PREFIX=%s\n' "${subnet##*/}"
+    printf 'PORT=%s\n' "$port"
+    printf 'ENDPOINT=%s\n' "$endpoint"
+    printf 'DNS=%s\n' "${VPN_DNS:-$sip}"
+    printf 'CREATED=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "$VPN_SERVER_CONF"
+  chmod 600 "$VPN_SERVER_CONF"
+
+  # seed IPAM with the server address so no peer can ever take it
+  grep -q " server$" "$VPN_IPAM_FILE" 2>/dev/null || printf '%s server\n' "$sip" >> "$VPN_IPAM_FILE"
+
+  log INFO "init: subnet=$subnet port=$port"
+  ok "Server initialised. Public key:"
+  info "  $(keys_pubkey server)"
+  info ""
+  info "Next: vpn peer add <name>    then    vpn start"
+}
+
+# ==========================================================================
+# peer
+# ==========================================================================
+cmd_peer() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    add)    peer_add "$@" ;;
+    list)   peer_list_cmd ;;
+    show)   peer_show "$@" ;;
+    export) peer_export "$@" ;;
+    remove|rm) peer_remove "$@" ;;
+    *) die "peer: unknown subcommand '$sub' (add|list|show|export|remove)" ;;
+  esac
+}
+
+peer_add() {
+  require_initialised
+  local name="" mode="full" extra_nets=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --split) mode="split" ;;
+      --route) shift; extra_nets="$extra_nets $1" ;;
+      -*) die "peer add: unknown option '$1'" ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+
+  [ -n "$name" ] || die "peer add: a name is required (e.g. 'vpn peer add phone')"
+  valid_name "$name" || die_with_action \
+    "'$name' is not a valid peer name." \
+    "Names must be lowercase letters, digits and dashes, 1-32 chars, starting alphanumeric." \
+    "vpn peer add $(printf '%s' "$name" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9-')"
+  peer_exists "$name" && die "peer add: '$name' already exists (see 'vpn peer show $name')"
+  [ "$name" = "server" ] && die "peer add: 'server' is reserved"
+
+  ensure_state_dirs
+  local subnet; subnet="$(conf_get SUBNET)"
+  local ip; ip="$(ipam_allocate "$VPN_IPAM_FILE" "$subnet" "$name")" || die_with_action \
+    "No free address in $subnet." "The VPN subnet is full." \
+    "Remove an unused peer, or re-init with a larger subnet."
+
+  keys_generate "$name"
+  keys_generate_psk "$name"
+  peer_write_record "$name" "$(keys_pubkey "$name")" "$ip" active ""
+
+  ok "Added peer '$name' at $ip ($mode tunnel)"
+  info "Export its config with:  vpn peer export $name"
+  [ -n "$(conf_get ENDPOINT)" ] || warn "No server endpoint set yet — the exported config will need one before it can connect."
+  log INFO "peer add: $name ip=$ip mode=$mode"
+}
+
+peer_list_cmd() {
+  require_initialised
+  local names; names="$(peer_list_names)"
+  if [ -z "$names" ]; then info "No peers yet. Add one with 'vpn peer add <name>'."; return 0; fi
+  printf '%-16s %-14s %-8s %s\n' NAME ADDRESS STATUS CREATED >&2
+  local n
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    printf '%-16s %-14s %-8s %s\n' \
+      "$n" "$(peer_get "$n" address)" "$(peer_get "$n" status)" "$(peer_get "$n" created_at)" >&2
+  done <<< "$names"
+}
+
+peer_show() {
+  require_initialised
+  local name="${1:-}"; [ -n "$name" ] || die "peer show: a name is required"
+  peer_exists "$name" || die "peer show: no such peer '$name'"
+  # deliberately reads the record only — never the private key
+  cat "$(peer_file "$name")" >&2
+}
+
+peer_export() {
+  require_initialised
+  local name="${1:-}"; shift || true
+  [ -n "$name" ] || die "peer export: a name is required"
+  peer_exists "$name" || die "peer export: no such peer '$name'"
+
+  local qr=0
+  while [ $# -gt 0 ]; do case "$1" in --qr) qr=1 ;; esac; shift; done
+
+  local subnet endpoint dns sip prefix
+  subnet="$(conf_get SUBNET)"; endpoint="$(conf_get ENDPOINT)"
+  dns="$(conf_get DNS)"; sip="$(conf_get SERVER_ADDRESS)"; prefix="$(conf_get PREFIX)"
+  local port; port="$(conf_get PORT)"
+  [ -n "$endpoint" ] || die_with_action \
+    "No server endpoint is configured." \
+    "The client needs to know the public 'host:port' to reach the server." \
+    "vpn config set-endpoint <host>:$port   (usually your home public IP)"
+
+  local allowed
+  # Full tunnel unless the record was marked split; for now default full.
+  allowed="0.0.0.0/0"
+
+  local conf
+  conf="$(render_client_conf \
+    "$(keys_read_private "$name")" \
+    "$(peer_get "$name" address)" "$prefix" "$dns" \
+    "$(keys_pubkey server)" "$(keys_read_psk "$name" 2>/dev/null)" \
+    "$endpoint:$port" "$allowed" 25)"
+
+  if [ "$qr" -eq 1 ]; then
+    require_cmd qrencode qrencode
+    printf '%s' "$conf" | qrencode -t ansiutf8
+  else
+    printf '%s\n' "$conf"
+  fi
+  log INFO "peer export: $name (qr=$qr)"
+}
+
+peer_remove() {
+  require_initialised
+  local name="${1:-}"; [ -n "$name" ] || die "peer remove: a name is required"
+  peer_exists "$name" || die "peer remove: no such peer '$name'"
+
+  keys_remove "$name"
+  ipam_release "$VPN_IPAM_FILE" "$name"
+  rm -f "$(peer_file "$name")"
+  ok "Removed peer '$name' and freed its address."
+  warn "If the tunnel is running, apply the change with: vpn restart"
+  log INFO "peer remove: $name"
+}
+
+# ==========================================================================
+# lifecycle — thin wrappers over wg-quick, plus config assembly
+# ==========================================================================
+
+# assemble the live wg-quick config from server key + all peer records
+build_runtime_conf() {
+  local out="$1"
+  local spriv sip prefix port
+  spriv="$(keys_read_private server)"; sip="$(conf_get SERVER_ADDRESS)"
+  prefix="$(conf_get PREFIX)"; port="$(conf_get PORT)"
+
+  ( umask 077
+    {
+      render_server_interface "$spriv" "$sip" "$prefix" "$port"
+      local n
+      while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        [ "$(peer_get "$n" status)" = "active" ] || continue
+        render_server_peer "$n" "$(keys_pubkey "$n")" \
+          "$(peer_get "$n" address)" "$(keys_read_psk "$n" 2>/dev/null)"
+      done <<< "$(peer_list_names)"
+    } > "$out"
+  )
+  chmod 600 "$out"
+}
+
+cmd_start() {
+  require_macos; require_initialised
+  require_cmd wg-quick wireguard-tools
+  local rt="$VPN_CONFIG_DIR/wg-runtime.conf"
+  build_runtime_conf "$rt"
+  step "Bringing the tunnel up"
+  info "  This runs: sudo wg-quick up $rt"
+  info "  It creates a utunN interface and adds routes for the VPN subnet."
+  sudo wg-quick up "$rt" || die_with_action \
+    "wg-quick could not start the tunnel." \
+    "The interface failed to come up. Common causes: wireguard-go missing, or the port is in use." \
+    "vpn doctor    (and check: brew install wireguard-go)"
+  ok "Tunnel is up."
+  log INFO "start"
+}
+
+cmd_stop() {
+  require_macos; require_initialised
+  local rt="$VPN_CONFIG_DIR/wg-runtime.conf"
+  [ -f "$rt" ] || die "stop: no runtime config found — was the tunnel ever started?"
+  step "Bringing the tunnel down"
+  sudo wg-quick down "$rt" || warn "wg-quick down reported an error (it may already be down)."
+  ok "Tunnel is down."
+  log INFO "stop"
+}
+
+cmd_restart() { cmd_stop || true; cmd_start; }
+
+cmd_status() {
+  require_macos; require_initialised
+  require_cmd wg wireguard-tools
+  # 'wg show' needs the real interface name, which wg-quick maps from the conf.
+  info "${_C_B}Server${_C_RST}"
+  info "  Endpoint:    $(conf_get ENDPOINT):$(conf_get PORT)"
+  info "  VPN subnet:  $(conf_get SUBNET)"
+  info "  Address:     $(conf_get SERVER_ADDRESS)"
+  info ""
+  info "${_C_B}Peers${_C_RST} (from live WireGuard handshakes)"
+  # Real handshake data; a peer is only 'connected' if it has handshaked recently.
+  sudo wg show all latest-handshakes 2>/dev/null | while read -r _iface pub hs; do
+    [ -n "$pub" ] || continue
+    local now age name
+    now="$(date +%s)"; age=$(( now - hs ))
+    name="?"
+    local n
+    while IFS= read -r n; do
+      [ "$(keys_pubkey "$n" 2>/dev/null)" = "$pub" ] && { name="$n"; break; }
+    done <<< "$(peer_list_names)"
+    if [ "$hs" -gt 0 ] && [ "$age" -lt 180 ]; then
+      printf '  %-16s CONNECTED  (handshake %ss ago)\n' "$name" "$age" >&2
+    else
+      printf '  %-16s offline\n' "$name" >&2
+    fi
+  done
+  log INFO "status"
+}
+
+# ==========================================================================
+# config
+# ==========================================================================
+cmd_config() {
+  local sub="${1:-show}"; shift || true
+  case "$sub" in
+    show)         config_show ;;
+    validate)     config_validate ;;
+    set-endpoint) config_set_endpoint "$@" ;;
+    *) die "config: unknown subcommand '$sub' (show|validate|set-endpoint)" ;;
+  esac
+}
+
+# config show — prints non-secret settings. NEVER prints a private key.
+config_show() {
+  require_initialised
+  info "${_C_B}Server configuration${_C_RST}  ($VPN_SERVER_CONF)"
+  local k
+  while IFS='=' read -r k v; do
+    [ -n "$k" ] || continue
+    info "  $(printf '%-16s' "$k") $v"
+  done < "$VPN_SERVER_CONF"
+  info "  $(printf '%-16s' PUBLIC_KEY) $(keys_pubkey server 2>/dev/null)"
+  info ""
+  info "  $(peer_list_names | grep -c .) peer(s). Private keys are never shown here."
+}
+
+# config validate — structural checks before anything is applied.
+config_validate() {
+  require_initialised
+  local errs=0
+  step "Validating configuration"
+
+  local subnet port sip
+  subnet="$(conf_get SUBNET)"; port="$(conf_get PORT)"; sip="$(conf_get SERVER_ADDRESS)"
+
+  printf '%s' "$subnet" | grep -Eq '^[0-9.]+/[0-9]+$'     || { warn "SUBNET '$subnet' is not a CIDR"; errs=1; }
+  { [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; } 2>/dev/null     || { warn "PORT '$port' is out of range"; errs=1; }
+  [ "$(server_address "$subnet")" = "$sip" ]     || { warn "SERVER_ADDRESS '$sip' does not match subnet '$subnet'"; errs=1; }
+  keys_have server || { warn "server private key is missing"; errs=1; }
+  keys_audit_permissions || errs=1
+
+  # every peer must have keys, a record, and an in-subnet address
+  local n
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    keys_have "$n" || { warn "peer '$n' has no private key"; errs=1; }
+    ip4_in_cidr_local "$(peer_get "$n" address)" "$subnet"       || { warn "peer '$n' address is outside the subnet"; errs=1; }
+  done <<< "$(peer_list_names)"
+
+  if [ "$errs" -eq 0 ]; then ok "Configuration is valid."; else die "Configuration has problems (see above)."; fi
+}
+
+# small CIDR membership helper (server-side, avoids sourcing the doctor)
+ip4_in_cidr_local() {
+  local ip="$1" cidr="$2" net bits ipi neti mask
+  net="${cidr%%/*}"; bits="${cidr##*/}"
+  ipi=$(ip4_to_int "$ip")   || return 1
+  neti=$(ip4_to_int "$net") || return 1
+  [ "$bits" -eq 0 ] && return 0
+  mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+  [ $(( ipi & mask )) -eq $(( neti & mask )) ]
+}
+
+config_set_endpoint() {
+  require_initialised
+  local ep="${1:-}"
+  [ -n "$ep" ] || die "config set-endpoint: give a host or host:port (e.g. 203.0.113.9 or myhome.example:51820)"
+  # strip an accidental :port if the user included one; PORT is stored separately
+  local host="${ep%%:*}"
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/srvconf.XXXXXX")"
+  awk -v e="$host" 'BEGIN{done=0} /^ENDPOINT=/{print "ENDPOINT=" e; done=1; next} {print} END{if(!done)print "ENDPOINT=" e}'     "$VPN_SERVER_CONF" > "$tmp" && mv "$tmp" "$VPN_SERVER_CONF"
+  chmod 600 "$VPN_SERVER_CONF"
+  ok "Endpoint set to $host:$(conf_get PORT)"
+  info "Re-export any client configs so they pick up the new endpoint."
+  log INFO "config set-endpoint: $host"
+}
+
+# ==========================================================================
+# dispatch
+# ==========================================================================
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    init)     cmd_init "$@" ;;
+    peer)     cmd_peer "$@" ;;
+    start)    cmd_start "$@" ;;
+    stop)     cmd_stop "$@" ;;
+    restart)  cmd_restart "$@" ;;
+    status)   cmd_status "$@" ;;
+    config)   cmd_config "$@" ;;
+    doctor)   exec "$SELF_DIR/vpn-doctor" "$@" ;;
+    version|--version) info "vpn $VERSION" ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command '$cmd' (try 'vpn help')" ;;
+  esac
+}
+main "$@"

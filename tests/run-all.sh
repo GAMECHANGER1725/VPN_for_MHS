@@ -6,7 +6,7 @@ set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RC=0
-for SUITE in test-primitives.sh test-cgnat.sh test-report.sh test-ownership.sh; do
+for SUITE in test-primitives.sh test-cgnat.sh test-report.sh test-ownership.sh test-ipam.sh test-config.sh test-peers.sh; do
   printf '\n=== %s ===\n' "$SUITE"
   bash "$DIR/$SUITE" || RC=1
 done
@@ -36,7 +36,7 @@ fi
 
 if command -v shellcheck >/dev/null 2>&1; then
   printf '\n=== shellcheck ===\n'
-  if shellcheck -S warning "$DIR/../bin/vpn-doctor" "$DIR"/*.sh; then
+  if shellcheck -S warning -x "$DIR/../bin/vpn-doctor" "$DIR/../bin/vpn" "$DIR/../lib"/*.sh "$DIR"/*.sh; then
     printf '  ok   no warnings\n'
   else
     RC=1
