@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VPN for MHS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #060a08;
+    --panel: #0c1410;
+    --panel-border: #163224;
+    --green: #33ff8c;
+    --green-dim: #1c8f52;
+    --red: #ff4d5e;
+    --amber: #ffb020;
+    --text: #c9f7dc;
+    --text-dim: #5f8f76;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
+  }
+  canvas#rain {
+    position: fixed; inset: 0; z-index: 0; opacity: 0.16; pointer-events: none;
+  }
+  .scanlines {
+    position: fixed; inset: 0; z-index: 1; pointer-events: none;
+    background: repeating-linear-gradient(
+      to bottom, rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px,
+      rgba(0,0,0,0.12) 3px, rgba(0,0,0,0) 4px
+    );
+    mix-blend-mode: overlay;
+  }
+  .wrap {
+    position: relative; z-index: 2;
+    max-width: 780px; margin: 0 auto; padding: 3rem 1.5rem 4rem;
+  }
+  header { margin-bottom: 2rem; }
+  .brand {
+    font-size: 0.85rem; color: var(--text-dim); letter-spacing: 0.15em;
+  }
+  h1 {
+    font-size: 1.6rem; margin: 0.25rem 0 0; font-weight: 700;
+    color: var(--green); text-shadow: 0 0 12px rgba(51,255,140,0.35);
+  }
+  .cursor { display: inline-block; width: 0.55em; background: var(--green);
+    animation: blink 1s steps(1) infinite; margin-left: 2px; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 10px; padding: 1.25rem 1.5rem; margin-bottom: 1.25rem;
+    box-shadow: 0 0 24px rgba(51,255,140,0.04), inset 0 0 40px rgba(0,0,0,0.35);
+  }
+  .panel h2 {
+    font-size: 0.72rem; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--text-dim); margin: 0 0 0.9rem;
+  }
+
+  .status-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1.1rem; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--red);
+    box-shadow: 0 0 10px var(--red); flex-shrink: 0; }
+  .dot.on { background: var(--green); box-shadow: 0 0 12px var(--green); animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 8px var(--green); } 50% { box-shadow: 0 0 18px var(--green); } }
+  .status-text { font-size: 1.05rem; font-weight: 700; }
+  .status-text.on { color: var(--green); }
+  .status-text.off { color: var(--red); }
+
+  .btnrow { display: flex; gap: 0.75rem; margin-bottom: 0.4rem; }
+  button {
+    font-family: inherit; font-size: 0.95rem; font-weight: 700;
+    padding: 0.85rem 1.6rem; border-radius: 8px; border: 1px solid transparent;
+    cursor: pointer; letter-spacing: 0.03em; transition: transform 0.08s ease;
+  }
+  button:active { transform: scale(0.97); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #connect { background: var(--green); color: #04170c; box-shadow: 0 0 18px rgba(51,255,140,0.35); }
+  #disconnect { background: transparent; color: var(--red); border-color: var(--red); }
+  #msg { font-size: 0.8rem; color: var(--text-dim); min-height: 1.2em; margin-top: 0.5rem; }
+  #msg.err { color: var(--red); }
+
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.9rem; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  .stat { border: 1px solid var(--panel-border); border-radius: 8px; padding: 0.7rem 0.9rem; background: rgba(255,255,255,0.015); }
+  .stat .label { font-size: 0.68rem; letter-spacing: 0.08em; color: var(--text-dim); text-transform: uppercase; }
+  .stat .value { font-size: 1.02rem; margin-top: 0.25rem; word-break: break-word; }
+  .stat .value.warn { color: var(--amber); }
+  .stat .value.bad { color: var(--red); }
+  .stat .value.good { color: var(--green); }
+
+  .iprow { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+  .ip-big { font-size: 1.7rem; font-weight: 700; color: var(--green); text-shadow: 0 0 10px rgba(51,255,140,0.3); }
+  .ip-big.off { color: var(--text); text-shadow: none; }
+  .refresh-btn {
+    background: transparent; border: 1px solid var(--panel-border); color: var(--text-dim);
+    font-size: 0.75rem; padding: 0.4rem 0.7rem; border-radius: 6px;
+  }
+  .refresh-btn:hover { color: var(--green); border-color: var(--green-dim); }
+  .spin { display: inline-block; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  footer { color: var(--text-dim); font-size: 0.72rem; text-align: center; margin-top: 2rem; opacity: 0.6; }
+</style>
+</head>
+<body>
+<canvas id="rain"></canvas>
+<div class="scanlines"></div>
+
+<div class="wrap">
+  <header>
+    <div class="brand">VPN_FOR_MHS // LOCAL CONTROL</div>
+    <h1>root@vps-vnic:~<span class="cursor">&nbsp;</span></h1>
+  </header>
+
+  <section class="panel">
+    <h2>Tunnel</h2>
+    <div class="status-row">
+      <div id="dot" class="dot"></div>
+      <div id="statusText" class="status-text off">DISCONNECTED</div>
+    </div>
+    <div class="btnrow">
+      <button id="connect" onclick="doAction('connect')">Connect</button>
+      <button id="disconnect" onclick="doAction('disconnect')" style="display:none">Disconnect</button>
+    </div>
+    <div id="msg"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Public IP / Geolocation</h2>
+    <div class="iprow">
+      <div id="ipBig" class="ip-big off">—</div>
+      <button class="refresh-btn" onclick="refreshIp()">↻ refresh</button>
+    </div>
+    <div class="grid" style="margin-top: 1rem;">
+      <div class="stat"><div class="label">ISP</div><div class="value" id="ipIsp">—</div></div>
+      <div class="stat"><div class="label">Location</div><div class="value" id="ipLoc">—</div></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Link stats</h2>
+    <div class="grid">
+      <div class="stat"><div class="label">Connected since</div><div class="value" id="statSince">—</div></div>
+      <div class="stat"><div class="label">Duration</div><div class="value" id="statDuration">—</div></div>
+      <div class="stat"><div class="label">Endpoint</div><div class="value" id="statEndpoint">—</div></div>
+      <div class="stat"><div class="label">Listen port</div><div class="value" id="statPort">—</div></div>
+      <div class="stat"><div class="label">Last handshake</div><div class="value" id="statHandshake">—</div></div>
+      <div class="stat"><div class="label">Allowed IPs</div><div class="value" id="statAllowed">—</div></div>
+      <div class="stat"><div class="label">Received</div><div class="value" id="statRx">—</div></div>
+      <div class="stat"><div class="label">Sent</div><div class="value" id="statTx">—</div></div>
+    </div>
+  </section>
+
+  <footer>WireGuard · ChaCha20-Poly1305 · Curve25519 · this page never leaves 127.0.0.1</footer>
+</div>
+
+<script>
+let lastConnected = null;
+
+function fmtBytes(n) {
+  if (n === undefined || n === null) return '—';
+  const u = ['B','KiB','MiB','GiB','TiB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i === 0 ? 0 : 2) + ' ' + u[i];
+}
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
+}
+function fmtAgo(sec) {
+  if (sec <= 0) return 'never';
+  if (sec < 60) return sec + 's ago';
+  return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's ago';
+}
+
+async function refreshState() {
+  let j;
+  try {
+    const r = await fetch('/state');
+    j = await r.json();
+  } catch (e) {
+    j = { connected: false };
+  }
+
+  const dot = document.getElementById('dot');
+  const st = document.getElementById('statusText');
+  const btnC = document.getElementById('connect');
+  const btnD = document.getElementById('disconnect');
+  const ipBig = document.getElementById('ipBig');
+
+  dot.className = 'dot' + (j.connected ? ' on' : '');
+  st.className = 'status-text ' + (j.connected ? 'on' : 'off');
+  st.textContent = j.connected ? 'CONNECTED' : 'DISCONNECTED';
+  btnC.style.display = j.connected ? 'none' : 'inline-block';
+  btnD.style.display = j.connected ? 'inline-block' : 'none';
+  ipBig.classList.toggle('off', !j.connected);
+
+  if (j.connected) {
+    document.getElementById('statSince').textContent = j.since ? new Date(j.since * 1000).toLocaleTimeString() : '—';
+    document.getElementById('statDuration').textContent = j.since ? fmtDuration((j.now || Date.now()/1000) - j.since) : '—';
+    document.getElementById('statEndpoint').textContent = j.endpoint || '—';
+    document.getElementById('statPort').textContent = j.listen_port || '—';
+    document.getElementById('statAllowed').textContent = j.allowed_ips || '—';
+    document.getElementById('statRx').textContent = fmtBytes(j.rx_bytes);
+    document.getElementById('statTx').textContent = fmtBytes(j.tx_bytes);
+    const hsAgo = j.latest_handshake ? Math.floor((j.now || Date.now()/1000) - j.latest_handshake) : -1;
+    const hsEl = document.getElementById('statHandshake');
+    hsEl.textContent = j.latest_handshake ? fmtAgo(hsAgo) : 'never';
+    hsEl.className = 'value ' + (hsAgo < 0 ? '' : hsAgo < 60 ? 'good' : hsAgo < 180 ? 'warn' : 'bad');
+  } else {
+    ['statSince','statDuration','statEndpoint','statPort','statAllowed','statRx','statTx','statHandshake']
+      .forEach(id => document.getElementById(id).textContent = '—');
+  }
+
+  if (lastConnected === null || lastConnected !== j.connected) {
+    lastConnected = j.connected;
+    refreshIp();
+  }
+}
+
+async function refreshIp() {
+  const btn = document.querySelector('.refresh-btn');
+  btn.innerHTML = '<span class="spin">↻</span> refresh';
+  try {
+    const r = await fetch('https://ipapi.co/json/', { cache: 'no-store' });
+    const j = await r.json();
+    document.getElementById('ipBig').textContent = j.ip || '—';
+    document.getElementById('ipIsp').textContent = j.org || j.asn || '—';
+    document.getElementById('ipLoc').textContent = [j.city, j.region, j.country_name].filter(Boolean).join(', ') || '—';
+  } catch (e) {
+    document.getElementById('ipIsp').textContent = 'lookup failed';
+  }
+  btn.innerHTML = '↻ refresh';
+}
+
+async function doAction(action) {
+  const msg = document.getElementById('msg');
+  msg.className = ''; msg.textContent = 'working...';
+  document.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {
+    const r = await fetch('/' + action, { method: 'POST' });
+    const j = await r.json();
+    if (!j.ok) { msg.className = 'err'; msg.textContent = 'error: ' + j.output; }
+    else { msg.textContent = ''; }
+  } catch (e) {
+    msg.className = 'err'; msg.textContent = 'error: ' + e;
+  }
+  document.querySelectorAll('button').forEach(b => b.disabled = false);
+  await refreshState();
+}
+
+refreshState();
+setInterval(refreshState, 2000);
+setInterval(refreshIp, 30000);
+
+// subtle matrix rain, low opacity, behind everything
+(function () {
+  const c = document.getElementById('rain');
+  const ctx = c.getContext('2d');
+  let w, h, cols, drops;
+  const chars = '01アイウエオカキクケコ$#%&+=<>/\\';
+  function resize() {
+    w = c.width = window.innerWidth;
+    h = c.height = window.innerHeight;
+    cols = Math.floor(w / 16);
+    drops = new Array(cols).fill(0).map(() => Math.random() * -50);
+  }
+  resize();
+  window.addEventListener('resize', resize);
+  function tick() {
+    ctx.fillStyle = 'rgba(6,10,8,0.08)';
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = '#33ff8c';
+    ctx.font = '14px monospace';
+    for (let i = 0; i < cols; i++) {
+      const ch = chars[Math.floor(Math.random() * chars.length)];
+      ctx.fillText(ch, i * 16, drops[i] * 16);
+      drops[i] = drops[i] * 16 > h && Math.random() > 0.975 ? 0 : drops[i] + 1;
+    }
+  }
+  setInterval(tick, 60);
+})();
+</script>
+</body>
+</html>
