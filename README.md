@@ -191,6 +191,7 @@ bin/
   vpn-doctor         Phase 1 environment audit (read-only)
   upnp-wan-ip.py     Router WAN address query via UPnP IGD (read-only)
   stun-probe.py      Outbound-UDP test via STUN (read-only)
+  vpn-connect-ui.py  Local-only Connect/Disconnect web UI for the macOS client
 tests/
   run-all.sh         Run every suite + syntax + shellcheck
   test-stun.py       STUN message parser

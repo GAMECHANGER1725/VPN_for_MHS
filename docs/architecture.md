@@ -131,6 +131,31 @@ advertises `::/0` over a broken IPv6 path blackholes client traffic, which is
 worse than no IPv6 at all. Until confirmed, client configs get explicit IPv6
 leak prevention instead of silence.
 
+## Client convenience: `bin/vpn-connect-ui.py`
+
+A one-click Connect/Disconnect page for the macOS client, replacing
+`sudo wg-quick up/down` typed by hand. It is a local-only web server
+(binds `127.0.0.1`, never a public interface) serving a page whose button
+calls back into the same process to run the real command — a public
+webpage cannot flip a device's VPN on itself, so this only exists because
+the page and the thing running the command are on the same machine. It is
+not, and must never become, part of the public-facing site discussed for
+sharing access with other people; that is a separate, unbuilt piece of work.
+
+It runs `wg-quick` via `sudo -n` (non-interactive) so it can act
+instantly on a click rather than blocking on a password prompt from a
+background process. That requires a narrowly-scoped passwordless-sudo
+grant for the exact two commands, added via a dedicated file in
+`/etc/sudoers.d/` (never edit `/etc/sudoers` directly) and validated with
+`visudo -c` before trusting it:
+
+```
+<user> ALL=(root) NOPASSWD: <path to wg-quick> up <home>/.wireguard/laptop.conf, <path to wg-quick> down <home>/.wireguard/laptop.conf
+```
+
+Scoped to those two exact command lines — not `wg-quick` in general, and
+not root access in general.
+
 ---
 
 ## Planned layout
