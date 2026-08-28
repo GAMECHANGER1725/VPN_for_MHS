@@ -1031,6 +1031,7 @@ fi
 
 # --- pf ---------------------------------------------------------------------
 PF_STATUS="not inspected"; PF_RULE_COUNT=""; PF_NAT_COUNT=""; PF_ANCHORS=""
+PF_APPLE_ANCHORS=""
 PFCONF_EXISTS="no"; [ -f /etc/pf.conf ] && PFCONF_EXISTS="yes"
 
 if [ "$OPT_SUDO" -eq 1 ]; then
@@ -1040,8 +1041,18 @@ if [ "$OPT_SUDO" -eq 1 ]; then
   PF_INFO="$(sudo pfctl -s info 2>/dev/null)"
   if [ -n "$PF_INFO" ]; then
     PF_STATUS="$(printf '%s\n' "$PF_INFO" | awk -F': *' '/^Status:/{print $2; exit}' | awk '{print $1}')"
-    PF_RULE_COUNT="$(sudo pfctl -s rules 2>/dev/null | grep -c . )"
-    PF_NAT_COUNT="$(sudo pfctl -s nat 2>/dev/null | grep -c . )"
+    # A stock macOS /etc/pf.conf declares `nat-anchor "com.apple/*"` and
+    # `rdr-anchor "com.apple/*"`. Those are anchor *declarations*, not NAT
+    # rules — counting them makes every clean Mac look like it already runs
+    # NAT. Count only substantive rules.
+    PF_RULE_COUNT="$(sudo pfctl -s rules 2>/dev/null \
+      | grep -vE '^[[:space:]]*(anchor|nat-anchor|rdr-anchor|load anchor)' \
+      | grep -c . )"
+    PF_NAT_COUNT="$(sudo pfctl -s nat 2>/dev/null \
+      | grep -vE '^[[:space:]]*(anchor|nat-anchor|rdr-anchor|load anchor)' \
+      | grep -c . )"
+    PF_APPLE_ANCHORS="$(sudo pfctl -s nat 2>/dev/null \
+      | grep -cE '^[[:space:]]*(nat-anchor|rdr-anchor)' )"
     PF_ANCHORS="$(sudo pfctl -s Anchors 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
   else
     PF_STATUS="query failed (no sudo, or pf unavailable)"
@@ -1052,12 +1063,13 @@ fi
 
 kv "pf status"        "$PF_STATUS"
 kv "pf rules"         "${PF_RULE_COUNT:-?}"
-kv "pf nat rules"     "${PF_NAT_COUNT:-?}"
+kv "pf nat rules"     "${PF_NAT_COUNT:-?}${PF_APPLE_ANCHORS:+  (+$PF_APPLE_ANCHORS stock Apple anchor declarations, not rules)}"
 kv "pf anchors"       "${PF_ANCHORS:-?}"
 kv "/etc/pf.conf"     "$PFCONF_EXISTS"
 
 fact pf_status "$PF_STATUS";        fact pf_rule_count "$PF_RULE_COUNT"
-fact pf_nat_count "$PF_NAT_COUNT";  fact pf_anchors "$PF_ANCHORS"
+fact pf_nat_count "$PF_NAT_COUNT"
+fact pf_apple_anchor_decls "$PF_APPLE_ANCHORS";  fact pf_anchors "$PF_ANCHORS"
 fact pf_conf_exists "$PFCONF_EXISTS"
 
 if [ -n "$PF_NAT_COUNT" ] && [ "$PF_NAT_COUNT" -gt 0 ] 2>/dev/null; then
