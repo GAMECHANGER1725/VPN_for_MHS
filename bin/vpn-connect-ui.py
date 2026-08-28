@@ -22,6 +22,7 @@
 
 import json
 import os
+import re
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -33,6 +34,49 @@ WG = subprocess.run(["which", "wg"], capture_output=True, text=True).stdout.stri
 NAME_FILE = "/var/run/wireguard/laptop.name"
 
 PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vpn-connect-ui.html")
+
+
+def _parse_conf():
+    """Read the client's own laptop.conf for non-secret display fields.
+    Never returns the private key itself — only values derived from it
+    (the public key) or copied verbatim from non-secret lines."""
+    fields = {"client_name": os.path.splitext(os.path.basename(CONF))[0]}
+    try:
+        with open(CONF, "r") as f:
+            text = f.read()
+        priv = None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("Address"):
+                fields["tunnel_address"] = line.split("=", 1)[1].strip()
+            elif line.startswith("DNS"):
+                fields["configured_dns"] = line.split("=", 1)[1].strip()
+            elif line.startswith("PrivateKey"):
+                priv = line.split("=", 1)[1].strip()
+        if priv:
+            r = subprocess.run(["wg", "pubkey"], input=priv, capture_output=True, text=True)
+            if r.returncode == 0:
+                fields["client_public_key"] = r.stdout.strip()
+    except FileNotFoundError:
+        pass
+    return fields
+
+
+def _interface_details(iface):
+    """Best-effort MTU and active OS-level DNS for the live tunnel
+    interface. Read-only, no sudo required for either lookup."""
+    details = {"interface": iface}
+    r = subprocess.run(["ifconfig", iface], capture_output=True, text=True)
+    if r.returncode == 0:
+        m = re.search(r"mtu (\d+)", r.stdout)
+        if m:
+            details["mtu"] = m.group(1)
+    r = subprocess.run(["networksetup", "-getdnsservers", "Wi-Fi"], capture_output=True, text=True)
+    if r.returncode == 0:
+        out = r.stdout.strip()
+        if "aren't any" not in out:
+            details["active_dns"] = out.replace("\n", ", ")
+    return details
 
 
 def _parse_wg_dump(output):
@@ -87,17 +131,22 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self._html("<h1>vpn-connect-ui.html not found next to this script</h1>", 500)
         elif self.path == "/state":
+            conf_fields = _parse_conf()
             if not os.path.exists(NAME_FILE):
-                self._json({"connected": False})
+                self._json({"connected": False, **conf_fields})
                 return
             since = os.path.getmtime(NAME_FILE)
+            with open(NAME_FILE, "r") as f:
+                iface = f.read().strip()
             r = subprocess.run(["sudo", "-n", WG, "show", "all", "dump"], capture_output=True, text=True)
             if r.returncode != 0:
-                self._json({"connected": True, "since": since, "error": r.stderr.strip()})
+                self._json({"connected": True, "since": since, "error": r.stderr.strip(), **conf_fields})
                 return
             state = _parse_wg_dump(r.stdout)
             state["since"] = since
             state["now"] = time.time()
+            state.update(conf_fields)
+            state.update(_interface_details(iface))
             self._json(state)
         else:
             self._json({"error": "not found"}, 404)

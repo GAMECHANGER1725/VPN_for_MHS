@@ -155,7 +155,22 @@
     </div>
   </section>
 
-  <footer>WireGuard · ChaCha20-Poly1305 · Curve25519 · this page never leaves 127.0.0.1</footer>
+  <section class="panel">
+    <h2>Client &amp; crypto</h2>
+    <div class="grid">
+      <div class="stat"><div class="label">Client name</div><div class="value" id="statClientName">—</div></div>
+      <div class="stat"><div class="label">Interface</div><div class="value" id="statIface">—</div></div>
+      <div class="stat"><div class="label">Tunnel address</div><div class="value" id="statTunnelAddr">—</div></div>
+      <div class="stat"><div class="label">MTU</div><div class="value" id="statMtu">—</div></div>
+      <div class="stat"><div class="label">Configured DNS</div><div class="value" id="statConfDns">—</div></div>
+      <div class="stat"><div class="label">Active OS DNS</div><div class="value" id="statActiveDns">—</div></div>
+      <div class="stat" style="grid-column: 1 / -1;"><div class="label">Client public key</div><div class="value" id="statClientPub" style="font-size:0.85rem;">—</div></div>
+      <div class="stat" style="grid-column: 1 / -1;"><div class="label">Server public key</div><div class="value" id="statServerPub" style="font-size:0.85rem;">—</div></div>
+      <div class="stat" style="grid-column: 1 / -1;"><div class="label">Cipher suite</div><div class="value">ChaCha20-Poly1305 · Curve25519 · BLAKE2s · SipHash24</div></div>
+    </div>
+  </section>
+
+  <footer>WireGuard · this page never leaves 127.0.0.1</footer>
 </div>
 
 <script>
@@ -200,6 +215,10 @@ async function refreshState() {
   btnD.style.display = j.connected ? 'inline-block' : 'none';
   ipBig.classList.toggle('off', !j.connected);
 
+  document.getElementById('statClientName').textContent = j.client_name || '—';
+  document.getElementById('statClientPub').textContent = j.client_public_key || '—';
+  document.getElementById('statConfDns').textContent = j.configured_dns || '—';
+
   if (j.connected) {
     document.getElementById('statSince').textContent = j.since ? new Date(j.since * 1000).toLocaleTimeString() : '—';
     document.getElementById('statDuration').textContent = j.since ? fmtDuration((j.now || Date.now()/1000) - j.since) : '—';
@@ -208,12 +227,18 @@ async function refreshState() {
     document.getElementById('statAllowed').textContent = j.allowed_ips || '—';
     document.getElementById('statRx').textContent = fmtBytes(j.rx_bytes);
     document.getElementById('statTx').textContent = fmtBytes(j.tx_bytes);
+    document.getElementById('statIface').textContent = j.interface || '—';
+    document.getElementById('statTunnelAddr').textContent = j.tunnel_address || '—';
+    document.getElementById('statMtu').textContent = j.mtu || '—';
+    document.getElementById('statActiveDns').textContent = j.active_dns || '—';
+    document.getElementById('statServerPub').textContent = j.server_public_key || '—';
     const hsAgo = j.latest_handshake ? Math.floor((j.now || Date.now()/1000) - j.latest_handshake) : -1;
     const hsEl = document.getElementById('statHandshake');
     hsEl.textContent = j.latest_handshake ? fmtAgo(hsAgo) : 'never';
     hsEl.className = 'value ' + (hsAgo < 0 ? '' : hsAgo < 60 ? 'good' : hsAgo < 180 ? 'warn' : 'bad');
   } else {
-    ['statSince','statDuration','statEndpoint','statPort','statAllowed','statRx','statTx','statHandshake']
+    ['statSince','statDuration','statEndpoint','statPort','statAllowed','statRx','statTx','statHandshake',
+     'statIface','statTunnelAddr','statMtu','statActiveDns','statServerPub']
       .forEach(id => document.getElementById(id).textContent = '—');
   }
 
@@ -226,14 +251,23 @@ async function refreshState() {
 async function refreshIp() {
   const btn = document.querySelector('.refresh-btn');
   btn.innerHTML = '<span class="spin">↻</span> refresh';
+  document.getElementById('ipIsp').textContent = 'looking up...';
+  document.getElementById('ipLoc').textContent = 'looking up...';
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
   try {
-    const r = await fetch('https://ipapi.co/json/', { cache: 'no-store' });
+    // ipwho.is: fast, HTTPS, no API key, no rate-limit auth needed.
+    const r = await fetch('https://ipwho.is/', { cache: 'no-store', signal: controller.signal });
     const j = await r.json();
     document.getElementById('ipBig').textContent = j.ip || '—';
-    document.getElementById('ipIsp').textContent = j.org || j.asn || '—';
-    document.getElementById('ipLoc').textContent = [j.city, j.region, j.country_name].filter(Boolean).join(', ') || '—';
+    document.getElementById('ipIsp').textContent = (j.connection && j.connection.isp) || '—';
+    document.getElementById('ipLoc').textContent = [j.city, j.region, j.country].filter(Boolean).join(', ') || '—';
   } catch (e) {
-    document.getElementById('ipIsp').textContent = 'lookup failed';
+    document.getElementById('ipIsp').textContent = e.name === 'AbortError' ? 'lookup timed out' : 'lookup failed';
+    document.getElementById('ipLoc').textContent = '—';
+  } finally {
+    clearTimeout(timeout);
   }
   btn.innerHTML = '↻ refresh';
 }
