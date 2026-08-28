@@ -71,7 +71,37 @@ definitionally conclusive one, produce `CONFIRMED`.
 
 ---
 
-## 3. What "zero-cost" excludes, and the line this project draws
+## 3. Networks you do not administer
+
+This project assumes you control the router. On a corporate, campus, school or
+other institutional network you do not, and that changes the problem from an
+engineering one into a permissions one.
+
+Concretely, on a managed network:
+
+- **You cannot create a port forward.** Inbound reachability is not yours to
+  arrange, and no amount of correct WireGuard configuration substitutes.
+- **The address you are given is not stable or yours.** Institutional DHCP
+  pools, VLAN reassignment and captive re-auth all move it.
+- **Egress is filtered by policy.** UDP on an arbitrary port may simply not
+  leave the network, and that is a deliberate configuration rather than a
+  fault.
+- **Acceptable-use policies apply.** Networks like this are administered under
+  a policy that generally covers running network services and tunnelling
+  traffic across the network boundary. A tunnel built to move traffic past
+  those controls is normally a breach of it regardless of how well it is
+  engineered, and the consequences fall on the account holder rather than on
+  the software.
+
+`vpn-doctor` classifies this case and returns RED. If you have a legitimate
+need to reach services on such a network from outside, the route is the
+organisation's IT function — they usually already run a supported remote-access
+method, and asking is both faster and safer than building around them.
+
+None of this applies to your own home network, which is what the rest of this
+project is about.
+
+## 4. What "zero-cost" excludes, and the line this project draws
 
 There is a genuine architectural distinction the project will always make
 explicit:
@@ -100,7 +130,7 @@ for option A. You will always know which one you are running.
 
 ---
 
-## 4. Dynamic public IP, with no paid DDNS
+## 5. Dynamic public IP, with no paid DDNS
 
 Residential IPs change — at reconnect, at ISP maintenance, sometimes on a
 timer. When yours changes, existing client configs point at the wrong address.
@@ -124,7 +154,7 @@ hiding a dependency.
 
 ---
 
-## 5. macOS-specific constraints
+## 6. macOS-specific constraints
 
 - **No kernel WireGuard.** macOS runs `wireguard-go` in userspace on a `utun`
   interface. Correct and supported, but slower and more CPU-hungry than a
@@ -145,7 +175,7 @@ hiding a dependency.
 
 ---
 
-## 6. What the diagnostic genuinely cannot determine
+## 7. What the diagnostic genuinely cannot determine
 
 Recorded so no one mistakes silence for a pass:
 
@@ -160,7 +190,7 @@ Recorded so no one mistakes silence for a pass:
 
 ---
 
-## 7. Non-goals, permanently
+## 8. Non-goals, permanently
 
 - Custom cryptography.
 - A custom VPN protocol.

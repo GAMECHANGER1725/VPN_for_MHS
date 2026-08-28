@@ -98,7 +98,7 @@ environment.
 |---|---|
 | **GREEN** | Directly reachable and suitable. Only awarded after a real inbound handshake from outside your network — never from a self-test. |
 | **YELLOW** | Workable, with router configuration or a stated caveat. |
-| **RED** | Direct inbound connectivity is unavailable. |
+| **RED** | Direct inbound connectivity is unavailable, or this is not a network you administer. |
 | **UNKNOWN** | `--offline`, or evidence was insufficient. |
 
 `vpn-doctor` will not report GREEN from inside your own LAN. A host cannot
@@ -109,6 +109,23 @@ Phase 3, with a real client on cellular data.
 Full breakdown of every check: [docs/reconnaissance.md](docs/reconnaissance.md).
 
 ---
+
+## Is this even your network?
+
+The audit checks whether the network it is running on is one you administer,
+because the whole project assumes you can configure the router. Five signals
+are weighed: a LAN larger than a `/24`, a DHCP-supplied directory search
+domain, DNS that is neither the gateway nor on the local subnet, ICMP filtered
+while HTTPS passes, and multiple layers of private routing.
+
+Two or more and the run is classified **managed / institutional** and returns
+RED. On a corporate, campus or school network you do not own the router,
+inbound port forwarding is not yours to arrange, and whether a tunnel may cross
+the network boundary at all is a question for whoever administers it — not one
+that better WireGuard configuration answers.
+
+One signal is deliberately not enough. A home behind two routers trips exactly
+one, and the tool must not accuse a residential network of being institutional.
 
 ## Architecture
 
@@ -151,6 +168,7 @@ tests/
   run-all.sh         Run every suite + syntax + shellcheck
   test-primitives.sh Address/CIDR arithmetic
   test-cgnat.sh      CGNAT classification scenarios
+  test-ownership.sh  Managed-network detection, NAT typing
   test-report.sh     JSON report emitter
 docs/
   reconnaissance.md  What the audit checks and how to read it
@@ -165,12 +183,13 @@ reports/            Audit output (gitignored)
 bash tests/run-all.sh
 ```
 
-85 assertions across three suites, plus syntax checks and shellcheck:
+102 assertions across four suites, plus syntax checks and shellcheck:
 
 | Suite | Covers |
 |---|---|
 | `test-primitives.sh` | IPv4→int, CIDR containment, RFC 6598 boundaries, RFC 1918, netmask→prefix, subnet overlap, IPv6 classification, JSON escaping |
 | `test-cgnat.sh` | The CGNAT classifier against realistic topologies: single-NAT home broadband, confirmed CGNAT via three different signals, double NAT, no NAT, insufficient evidence, `100.64.0.0/10` boundaries, and state leakage between runs |
+| `test-ownership.sh` | Whether the network is one you administer, and the split between carrier-grade NAT and multi-layer private NAT — including a regression case built from a real institutional network the tool originally misread |
 | `test-report.sh` | JSON emitter — empty report, facts, findings, and hostile content (embedded quotes, backslashes, newlines, tabs) validated by a real JSON parser |
 
 These functions decide whether the tool tells you "port forwarding will work"

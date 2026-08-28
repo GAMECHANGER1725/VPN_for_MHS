@@ -146,6 +146,9 @@ emit_json() {
   printf '  ]\n}\n'
 }
 
+# Collapse repeated lines while preserving first-seen order.
+dedupe_lines() { awk '!seen[$0]++'; }
+
 # --------------------------------------------------------------------------
 # IPv4 / CIDR arithmetic (pure bash, no dependencies)
 # --------------------------------------------------------------------------
@@ -226,16 +229,17 @@ classify_cgnat() {
   CGNAT_STATE="unknown"
   CGNAT_EVIDENCE=""
   NAT_LAYERS="unknown"
+  NAT_TYPE="unknown"
 
   add_ev() { CGNAT_EVIDENCE="${CGNAT_EVIDENCE}${CGNAT_EVIDENCE:+; }$1"; }
 
   # Signal 1: is the address the Internet sees actually routable?
   if [ -n "$pub4" ]; then
     if is_cgnat "$pub4"; then
-      CGNAT_STATE="confirmed"
+      CGNAT_STATE="confirmed"; NAT_TYPE="cgnat"
       add_ev "the address the Internet sees ($pub4) is itself inside 100.64.0.0/10, which is not globally routable"
     elif is_special4 "$pub4"; then
-      CGNAT_STATE="confirmed"
+      CGNAT_STATE="confirmed"; NAT_TYPE="cgnat"
       add_ev "the address the Internet sees ($pub4) is a reserved/private range and cannot accept inbound traffic"
     fi
   fi
@@ -244,6 +248,7 @@ classify_cgnat() {
   if [ -n "$cgnat_hop" ]; then
     add_ev "traceroute crosses a carrier-grade NAT hop at $cgnat_hop (100.64.0.0/10)"
     [ "$CGNAT_STATE" = "unknown" ] && CGNAT_STATE="confirmed"
+    NAT_TYPE="cgnat"
   fi
 
   # Signal 3: does the router agree with the Internet about its own address?
@@ -252,23 +257,40 @@ classify_cgnat() {
       add_ev "the router's WAN address equals the address the Internet sees, so there is no NAT above your router"
       [ "$CGNAT_STATE" = "unknown" ] && CGNAT_STATE="none"
       NAT_LAYERS="1"
+      [ "$NAT_TYPE" = "unknown" ] && NAT_TYPE="single"
     else
       add_ev "the router believes its WAN address is $rwan but the Internet sees $pub4, so at least one NAT sits above your router"
       CGNAT_STATE="confirmed"
       NAT_LAYERS="2+"
+      if is_cgnat "$rwan"; then NAT_TYPE="cgnat"
+      else [ "$NAT_TYPE" = "unknown" ] && NAT_TYPE="multi-layer-private"; fi
     fi
   fi
 
-  # Weak signal: several private hops before the first routable one.
+  # Weak signal: several private hops before the first globally routable one.
+  #
+  # This means traffic crosses more than one NAT, but it does NOT by itself
+  # mean *carrier-grade* NAT. If the address the Internet sees is a normal
+  # routable one and no 100.64.0.0/10 hop appeared, the extra layers are more
+  # likely an enterprise, campus, or double-router topology. The consequence
+  # for inbound connections is the same; the remedy is not, so the two are
+  # reported as different things.
   if [ "$CGNAT_STATE" = "unknown" ] && [ "$priv_hops" -ge 2 ]; then
-    CGNAT_STATE="likely"
-    add_ev "$priv_hops consecutive private hops at the network edge suggests double NAT"
     NAT_LAYERS="2+"
+    if [ -n "$pub4" ] && ! is_special4 "$pub4"; then
+      CGNAT_STATE="none"
+      NAT_TYPE="multi-layer-private"
+      add_ev "$priv_hops consecutive private hops precede the first globally routable hop, so traffic crosses more than one NAT; the observed public address ($pub4) is routable and no 100.64.0.0/10 hop appeared, so this is multi-layer private NAT (enterprise, campus or double-router) rather than carrier-grade NAT"
+    else
+      CGNAT_STATE="likely"
+      NAT_TYPE="cgnat"
+      add_ev "$priv_hops consecutive private hops at the network edge, with no routable public address observed, suggests carrier-grade NAT"
+    fi
   fi
 
   # Clean single-NAT case.
   if [ "$CGNAT_STATE" = "unknown" ] && [ -n "$pub4" ] && [ "$priv_hops" -le 1 ] && [ -n "$trace" ]; then
-    CGNAT_STATE="none"
+    CGNAT_STATE="none"; NAT_TYPE="single"
     add_ev "a single private hop (your router) precedes globally routable hops, and the observed public address is routable"
     NAT_LAYERS="1"
   fi
@@ -276,8 +298,79 @@ classify_cgnat() {
   # No NAT at all: this machine holds the public address.
   if [ -n "$pub4" ] && [ "$pub4" = "$lan4" ]; then
     add_ev "this Mac holds the public address directly — there is no NAT at all"
-    CGNAT_STATE="none"; NAT_LAYERS="0"
+    CGNAT_STATE="none"; NAT_LAYERS="0"; NAT_TYPE="none"
   fi
+}
+
+# --------------------------------------------------------------------------
+# assess_network_ownership — is this a network you control?
+#
+#   assess_network_ownership <lan_prefix> <lan_cidr> <search_domains> \
+#                            <resolvers> <gw4> <icmp_ok> <https_ok> <priv_hops>
+#
+# Sets: NET_OWNERSHIP          residential | managed | unknown
+#       NET_OWNERSHIP_SCORE    count of managed-network signals
+#       NET_OWNERSHIP_SIGNALS  human-readable list
+#
+# This exists because the entire project assumes you administer the router. On
+# a corporate, campus or institutional network you do not, and no amount of
+# correct WireGuard configuration changes that. Catching it here saves building
+# on a false premise.
+# --------------------------------------------------------------------------
+assess_network_ownership() {
+  local prefix="${1:-}" cidr="${2:-}" search="${3:-}" resolvers="${4:-}"
+  local gw="${5:-}" icmp="${6:-1}" https="${7:-0}" hops="${8:-0}"
+
+  NET_OWNERSHIP="unknown"
+  NET_OWNERSHIP_SCORE=0
+  NET_OWNERSHIP_SIGNALS=""
+
+  add_sig() {
+    NET_OWNERSHIP_SIGNALS="${NET_OWNERSHIP_SIGNALS}${NET_OWNERSHIP_SIGNALS:+; }$1"
+    NET_OWNERSHIP_SCORE=$(( NET_OWNERSHIP_SCORE + 1 ))
+  }
+
+  # 1. Consumer routers hand out /24. Anything larger is a planned network.
+  if [ -n "$prefix" ] && [ "$prefix" -lt 24 ] 2>/dev/null; then
+    add_sig "the LAN is a /$prefix, far larger than the /24 a consumer router hands out"
+  fi
+
+  # 2. A DNS search domain that is not a home-ish suffix implies a directory.
+  if [ -n "$search" ]; then
+    local d keep=""
+    for d in $search; do
+      case "$(printf '%s' "$d" | tr 'A-Z' 'a-z')" in
+        local|home|lan|localdomain|home.arpa|*.local) ;;
+        *) keep="$d" ;;
+      esac
+    done
+    [ -n "$keep" ] && add_sig "DHCP supplies the search domain '$keep', which indicates a managed directory rather than a home router"
+  fi
+
+  # 3. On a home network the resolver is nearly always the gateway itself.
+  if [ -n "$resolvers" ] && [ -n "$gw" ]; then
+    local first_ns in_lan=0 is_gw=0
+    first_ns="$(printf '%s' "$resolvers" | awk '{print $1}')"
+    [ "$first_ns" = "$gw" ] && is_gw=1
+    if [ -n "$cidr" ] && ip4_in_cidr "$first_ns" "$cidr" 2>/dev/null; then in_lan=1; fi
+    if [ "$is_gw" -eq 0 ] && [ "$in_lan" -eq 0 ]; then
+      add_sig "DNS is a central server ($first_ns) that is neither the gateway nor on the local subnet"
+    fi
+  fi
+
+  # 4. ICMP filtered while HTTPS passes is a policy decision, not a home default.
+  if [ "$icmp" -eq 0 ] && [ "$https" -eq 1 ]; then
+    add_sig "outbound ICMP is filtered while HTTPS passes, which is a deliberate egress policy"
+  fi
+
+  # 5. Multiple private hops before the edge.
+  if [ "$hops" -ge 2 ] 2>/dev/null; then
+    add_sig "$hops layers of private routing sit between this machine and the Internet edge"
+  fi
+
+  if   [ "$NET_OWNERSHIP_SCORE" -ge 2 ]; then NET_OWNERSHIP="managed"
+  elif [ "$NET_OWNERSHIP_SCORE" -eq 0 ]; then NET_OWNERSHIP="residential"
+  else NET_OWNERSHIP="unknown"; fi
 }
 
 # IPv6 classification by textual prefix (sufficient for our purposes)
@@ -585,19 +678,30 @@ fi
 hdr "DNS"
 
 SCUTIL_DNS="$(scutil --dns 2>/dev/null)"
-# Resolver #1 is the one used for general queries.
-PRIMARY_NS="$(printf '%s\n' "$SCUTIL_DNS" \
+
+# `scutil --dns` emits the resolver list twice: once as "DNS configuration"
+# and again as "DNS configuration (for scoped queries)". Both blocks contain a
+# "resolver #1", so parsing the whole output reports every value twice. Take
+# the first block only.
+SCUTIL_DNS_MAIN="$(printf '%s\n' "$SCUTIL_DNS" | awk '/for scoped queries/{exit} {print}')"
+
+PRIMARY_NS="$(printf '%s\n' "$SCUTIL_DNS_MAIN" \
   | awk '/^resolver #1$/{f=1;next} /^resolver #[2-9]/{f=0} f && /nameserver\[/{print $3}' \
-  | tr '\n' ' ' | sed 's/ *$//')"
+  | dedupe_lines | tr '\n' ' ' | sed 's/ *$//')"
 
 SVC_DNS=""
 if [ -n "$PRIMARY_SVC" ]; then
   SVC_DNS="$(networksetup -getdnsservers "$PRIMARY_SVC" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
 fi
+# networksetup reports "There aren't any DNS Servers set on <service>." rather
+# than returning empty, which is a sentence, not a value.
+case "$SVC_DNS" in
+  *"aren't any"*|*"There aren"*) SVC_DNS="" ;;
+esac
 
-SEARCH_DOMAINS="$(printf '%s\n' "$SCUTIL_DNS" \
+SEARCH_DOMAINS="$(printf '%s\n' "$SCUTIL_DNS_MAIN" \
   | awk '/^resolver #1$/{f=1;next} /^resolver #[2-9]/{f=0} f && /search domain\[/{print $4}' \
-  | tr '\n' ' ' | sed 's/ *$//')"
+  | dedupe_lines | tr '\n' ' ' | sed 's/ *$//')"
 
 kv "Active resolvers"    "${PRIMARY_NS:-NONE}"
 kv "Service DNS setting" "${SVC_DNS:-<empty — DHCP supplied>}"
@@ -633,7 +737,7 @@ fact dns_resolves "$DNS_RESOLVE_OK"
 if [ "$OPT_OFFLINE" -eq 0 ] && have dig && [ -n "$PRIMARY_NS" ]; then
   say ""
   note "Per-resolver check (can a VPN client be pointed at these?):"
-  for NS in $PRIMARY_NS; do
+  for NS in $(printf '%s\n' $PRIMARY_NS | dedupe_lines); do
     R="$(dig +short +time=2 +tries=1 "@$NS" "$DNS_TEST_NAME" A 2>/dev/null | head -1)"
     [ "$OPT_JSON" -eq 1 ] || printf '    %-40s %s\n' "$NS" "$([ -n "$R" ] && echo "responds" || echo "NO RESPONSE")"
   done
@@ -659,32 +763,53 @@ ping6t() {
   else ping -6 -c 2 "$1" >/dev/null 2>&1; fi
 }
 
-GW_REACHABLE=0; NET4_OK=0; NET6_OK=0; HTTPS_OK=0
+GW_REACHABLE=0; ICMP4_OK=0; ICMP6_OK=0; HTTPS_OK=0; NET4_OK=0
 
 if [ "$OPT_OFFLINE" -eq 0 ]; then
   [ -n "$GW4" ] && { ping4 "$GW4" && GW_REACHABLE=1; }
-  ping4 "$PING4_TARGET" && NET4_OK=1
-  ping6t "$PING6_TARGET" && NET6_OK=1
+  ping4  "$PING4_TARGET" && ICMP4_OK=1
+  ping6t "$PING6_TARGET" && ICMP6_OK=1
   if have curl; then
     curl -4 -s -o /dev/null --max-time 6 "$IPV4_ECHO_URL" && HTTPS_OK=1
   fi
-  kv "Gateway reachable"  "$([ $GW_REACHABLE -eq 1 ] && echo YES || echo "NO (${GW4:-no gateway})")"
-  kv "IPv4 Internet"      "$([ $NET4_OK  -eq 1 ] && echo "AVAILABLE (icmp $PING4_TARGET)" || echo "UNAVAILABLE")"
-  kv "IPv6 Internet"      "$([ $NET6_OK  -eq 1 ] && echo "AVAILABLE (icmp $PING6_TARGET)" || echo "UNAVAILABLE")"
-  kv "HTTPS egress"       "$([ $HTTPS_OK -eq 1 ] && echo OK || echo FAILED)"
+
+  # ICMP echo is routinely filtered on managed networks while TCP and UDP pass
+  # freely. Treating a failed ping as "no Internet" would be wrong, so IPv4
+  # reachability is the OR of the two independent probes.
+  [ "$ICMP4_OK" -eq 1 ] || [ "$HTTPS_OK" -eq 1 ] && NET4_OK=1
+
+  V4_DETAIL="UNAVAILABLE"
+  if   [ "$ICMP4_OK" -eq 1 ] && [ "$HTTPS_OK" -eq 1 ]; then V4_DETAIL="AVAILABLE (ICMP + HTTPS)"
+  elif [ "$HTTPS_OK" -eq 1 ];  then V4_DETAIL="AVAILABLE (HTTPS; ICMP echo filtered)"
+  elif [ "$ICMP4_OK" -eq 1 ];  then V4_DETAIL="AVAILABLE (ICMP; HTTPS blocked)"
+  fi
+
+  kv "Gateway reachable"  "$([ $GW_REACHABLE -eq 1 ] && echo YES || echo "NO (${GW4:-no gateway}) — may be ICMP filtering, not a fault")"
+  kv "IPv4 Internet"      "$V4_DETAIL"
+  kv "IPv6 Internet"      "$([ $ICMP6_OK -eq 1 ] && echo "AVAILABLE (icmp $PING6_TARGET)" || echo "UNAVAILABLE")"
+  kv "HTTPS egress"       "$([ $HTTPS_OK  -eq 1 ] && echo OK || echo FAILED)"
 else
   kv "All probes"         "SKIPPED (offline)"
 fi
 
+NET6_OK="$ICMP6_OK"
+
 fact gateway_reachable "$GW_REACHABLE"
 fact ipv4_internet "$NET4_OK"
+fact icmp4_ok "$ICMP4_OK"
 fact ipv6_internet "$NET6_OK"
 fact https_egress "$HTTPS_OK"
 
-if [ "$OPT_OFFLINE" -eq 0 ] && [ "$NET4_OK" -eq 0 ] && [ "$HTTPS_OK" -eq 0 ]; then
+if [ "$OPT_OFFLINE" -eq 0 ] && [ "$NET4_OK" -eq 0 ]; then
   finding BLOCK NO_INTERNET \
     "No IPv4 Internet connectivity could be confirmed (ICMP and HTTPS both failed)." \
     "Reachability analysis below is unreliable. Fix connectivity and re-run."
+fi
+
+if [ "$OPT_OFFLINE" -eq 0 ] && [ "$ICMP4_OK" -eq 0 ] && [ "$HTTPS_OK" -eq 1 ]; then
+  finding INFO ICMP_FILTERED \
+    "Outbound ICMP echo is filtered, but TCP/HTTPS egress works." \
+    "Normal on managed and corporate networks, rare on residential ones. Ping-based troubleshooting will mislead you here, and this is one signal that the network is centrally administered."
 fi
 
 # ==========================================================================
@@ -759,6 +884,13 @@ classify_cgnat "$PUB4" "$LAN_IP4" "$ROUTER_WAN" "$CGNAT_HOP" "$PRIVATE_HOP_COUNT
 
 say ""
 kv "NAT layers (est.)" "$NAT_LAYERS"
+case "$NAT_TYPE" in
+  cgnat)                kv "NAT type" "carrier-grade NAT" ;;
+  multi-layer-private)  kv "NAT type" "multi-layer private NAT (enterprise / campus / double router)" ;;
+  single)               kv "NAT type" "single NAT at your router" ;;
+  none)                 kv "NAT type" "none" ;;
+  *)                    kv "NAT type" "undetermined" ;;
+esac
 case "$CGNAT_STATE" in
   confirmed) kv "CGNAT" "${C_RED}CONFIRMED${C_RST}" ;;
   likely)    kv "CGNAT" "${C_YEL}LIKELY${C_RST}" ;;
@@ -768,6 +900,7 @@ esac
 [ -n "$CGNAT_EVIDENCE" ] && note "Evidence: $CGNAT_EVIDENCE"
 
 fact cgnat_state "$CGNAT_STATE"
+fact nat_type "$NAT_TYPE"
 fact cgnat_evidence "$CGNAT_EVIDENCE"
 fact nat_layers "$NAT_LAYERS"
 
@@ -777,8 +910,14 @@ if [ "$CGNAT_STATE" = "confirmed" ]; then
     "Port forwarding on your own router CANNOT fix this. The forward would only expose you on your router's private WAN address, which the Internet cannot reach. Inbound IPv4 requires either a public IPv4 address from your ISP, a working public IPv6 path, or an external rendezvous host — see docs/limitations.md."
 elif [ "$CGNAT_STATE" = "likely" ]; then
   finding WARN CGNAT_LIKELY \
-    "Evidence suggests carrier-grade NAT or double NAT, but it is not conclusive." \
+    "Evidence suggests carrier-grade NAT, but it is not conclusive." \
     "Enable UPnP on the router temporarily and re-run, or read the router's WAN status page and compare it against $PUB4."
+fi
+
+if [ "$NAT_TYPE" = "multi-layer-private" ]; then
+  finding WARN MULTI_LAYER_NAT \
+    "Traffic crosses $PRIVATE_HOP_COUNT layers of private NAT before reaching a routable hop. This is not carrier-grade NAT — the observed public address is routable — but inbound connections are blocked all the same." \
+    "Inbound requires a forwarding rule on EVERY NAT device in the path. On a home double-router setup you own both and can fix it. On an enterprise, campus or institutional network you own none of them, and this is not something to work around."
 fi
 
 # ==========================================================================
@@ -958,6 +1097,10 @@ DISABLESLEEP="$(printf '%s\n' "$PM_CUSTOM" | awk '$1=="disablesleep"{print $2; e
 ASSERTIONS="$(pmset -g assertions 2>/dev/null | awk '/PreventUserIdleSystemSleep/{print $NF; exit}')"
 
 kv "Power source"          "${POWER_SOURCE:-unknown}"
+if [ "${POWER_SOURCE:-}" = "Battery Power" ]; then
+  note "Currently on battery — the battery timers below are the ones in force,"
+  note "not the AC ones."
+fi
 kv "Sleep on AC (min)"     "${AC_SLEEP:-?}  $([ "${AC_SLEEP:-1}" = "0" ] && echo '(never — good for a server)' || echo '(will sleep — VPN goes down)')"
 kv "Sleep on battery (min)" "${BAT_SLEEP:-?}"
 kv "Disk sleep on AC"      "${AC_DISKSLEEP:-?}"
@@ -971,6 +1114,11 @@ fact ac_sleep "$AC_SLEEP";          fact battery_sleep "$BAT_SLEEP"
 fact ac_powernap "$AC_POWERNAP";    fact wake_on_network "$AC_WOMP"
 fact disablesleep "${DISABLESLEEP:-0}"
 
+if [ "${POWER_SOURCE:-}" = "Battery Power" ] && [ "${BAT_SLEEP:-0}" != "0" ]; then
+  finding WARN ON_BATTERY \
+    "This Mac is running on battery and sleeps after ${BAT_SLEEP:-?} minute(s) idle on battery." \
+    "A server needs to be on AC. The AC sleep timer is what matters for availability, and it is only in force while the machine is plugged in."
+fi
 if [ "${AC_SLEEP:-1}" != "0" ]; then
   finding WARN WILL_SLEEP \
     "On AC power this Mac sleeps after ${AC_SLEEP:-?} minutes of idle." \
@@ -1042,6 +1190,44 @@ if [ -z "$CHOSEN" ]; then
 fi
 
 # ==========================================================================
+# 11b. NETWORK OWNERSHIP
+# ==========================================================================
+hdr "NETWORK OWNERSHIP"
+
+assess_network_ownership "$LAN_PREFIX" "$LAN_CIDR" "$SEARCH_DOMAINS" \
+  "$PRIMARY_NS" "$GW4" "$ICMP4_OK" "$HTTPS_OK" "$PRIVATE_HOP_COUNT"
+
+case "$NET_OWNERSHIP" in
+  managed)     kv "Network type" "${C_RED}MANAGED / INSTITUTIONAL${C_RST}" ;;
+  residential) kv "Network type" "${C_GRN}looks residential${C_RST}" ;;
+  *)           kv "Network type" "UNCLEAR" ;;
+esac
+kv "Signals matched" "$NET_OWNERSHIP_SCORE of 5"
+[ -n "$NET_OWNERSHIP_SIGNALS" ] && note "Evidence: $NET_OWNERSHIP_SIGNALS"
+
+fact network_ownership "$NET_OWNERSHIP"
+fact network_ownership_score "$NET_OWNERSHIP_SCORE"
+fact network_ownership_signals "$NET_OWNERSHIP_SIGNALS"
+
+if [ "$NET_OWNERSHIP" = "managed" ]; then
+  say ""
+  note "This does not look like a home network, and this project assumes you"
+  note "administer the router. Two things follow:"
+  note ""
+  note "  1. The audit needs re-running on the network where the server will"
+  note "     actually live. Nothing measured here transfers to it."
+  note "  2. If the intent is to run the server on THIS network, that is a"
+  note "     different project with a different first question: whether the"
+  note "     network's owner permits it. Networks like this run under an"
+  note "     acceptable-use policy, and a tunnel that carries traffic across"
+  note "     their boundary is normally a breach of it, however well built."
+
+  finding BLOCK NOT_HOME_NETWORK \
+    "This audit was taken on a managed or institutional network, not a home network ($NET_OWNERSHIP_SCORE of 5 signals matched)." \
+    "Re-run on the network the server will live on; those results are what Phase 2 needs, and these are not. If this IS the intended network, the router is not yours to configure and the question is one of authorisation rather than engineering."
+fi
+
+# ==========================================================================
 # 12. VERDICT
 # ==========================================================================
 hdr "VERDICT"
@@ -1052,6 +1238,9 @@ VERDICT_REASON=""
 if [ "$OPT_OFFLINE" -eq 1 ]; then
   VERDICT="UNKNOWN"
   VERDICT_REASON="Offline mode: reachability was never tested, so no classification is possible."
+elif [ "$NET_OWNERSHIP" = "managed" ]; then
+  VERDICT="RED"
+  VERDICT_REASON="This is a managed or institutional network, not a home network. The router is not yours to configure, so inbound port forwarding is not available to you, and the rest of this report describes a network the VPN server is not going to live on. Re-run the audit where the server will actually run."
 elif [ "$NET4_OK" -eq 0 ] && [ "$HTTPS_OK" -eq 0 ]; then
   VERDICT="RED"
   VERDICT_REASON="No Internet connectivity from this machine. Nothing downstream can be assessed."
@@ -1127,7 +1316,7 @@ if [ "$OPT_JSON" -eq 1 ]; then
 fi
 
 if [ "$OPT_SAVE" -eq 1 ]; then
-  OUT_DIR="$SCRIPT_DIR/../reports"
+  OUT_DIR="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)/reports"
   mkdir -p "$OUT_DIR" 2>/dev/null
   OUT_FILE="$OUT_DIR/doctor-$(date '+%Y%m%d-%H%M%S').json"
   emit_json > "$OUT_FILE"

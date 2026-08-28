@@ -63,8 +63,14 @@ the router, and DNS never leaves your home.
 
 ### 6. Connectivity
 ICMP to the gateway and to the Internet on both families, plus an HTTPS fetch.
-If IPv4 Internet fails entirely, everything downstream is unreliable and the
-tool says so rather than continuing to reason from bad data.
+
+IPv4 reachability is the **OR** of ICMP and HTTPS, not ICMP alone. Managed
+networks routinely drop ICMP echo while passing TCP and UDP freely, so a failed
+ping is not evidence of a missing Internet path. The report distinguishes
+"AVAILABLE (ICMP + HTTPS)" from "AVAILABLE (HTTPS; ICMP echo filtered)", and
+the filtered case raises an `ICMP_FILTERED` finding — both because ping-based
+troubleshooting will mislead you there, and because it is one signal that the
+network is centrally administered.
 
 ### 7. Public addressing, NAT depth, CGNAT
 The most important section. Three independent signals:
@@ -83,6 +89,20 @@ The most important section. Three independent signals:
 `CONFIRMED` requires either a definitionally conclusive signal or two agreeing
 ones. `LIKELY` is a single suggestive signal. The evidence string is always
 printed, so you can check the reasoning rather than trust the label.
+
+The report also states a **NAT type**, because "several private hops" and
+"carrier-grade NAT" are not the same finding:
+
+| Type | Meaning |
+|---|---|
+| `none` | This machine holds the public address. |
+| `single` | One NAT, at your router. Port forwarding works. |
+| `multi-layer-private` | More than one NAT, but the observed public address is routable and no `100.64.0.0/10` hop appeared. Enterprise, campus, or double-router. |
+| `cgnat` | Carrier-grade NAT. |
+
+Both of the last two block inbound connections, but the remedies differ
+entirely — a double-router setup you own is fixable, and sending someone to
+their ISP over a campus network wastes everyone's time.
 
 Many routers ship with UPnP disabled. "No answer" is normal and benign, not a
 failure.
@@ -122,6 +142,21 @@ is most likely to land on (`192.168.0.0/24`, `192.168.1.0/24`, Docker's
 This second check matters: a full-tunnel client sitting on a café network that
 uses the same range as your VPN will have broken routing. Also suggests a
 random RFC 4193 ULA `/64` for the tunnel's IPv6 side.
+
+### 11b. Network ownership
+Weighs five signals to decide whether this is a network you administer: LAN
+prefix shorter than `/24`, a DHCP-supplied search domain that is not a
+home-style suffix, DNS that is neither the gateway nor on the local subnet,
+ICMP filtered while HTTPS passes, and two or more layers of private routing.
+
+Two or more signals classifies the run **managed / institutional** and forces
+RED. One signal is not enough — a home behind two routers trips exactly one,
+and a false accusation here is worse than a missed detection.
+
+This check exists because an early audit came back from a Department of
+Education network and the tool reported YELLOW, cheerfully recommending a VPN
+subnet for a router the user has no authority over. Every measurement in that
+report was individually correct and the conclusion was still useless.
 
 ### 12. Verdict
 

@@ -62,8 +62,13 @@ scenario "observed address is RFC1918 (broken/proxied egress)" \
 
 echo
 echo "Double NAT — router behind another router"
-scenario "two private hops, no UPnP, no conclusive signal" \
-  likely "2+" \
+# Two private hops means traffic crosses more than one NAT, but when the
+# observed public address is routable and no 100.64.0.0/10 hop appeared, that
+# is multi-layer private NAT, not carrier-grade NAT. Reporting it as CGNAT
+# sends the user to their ISP over a problem the ISP did not cause.
+# See test-ownership.sh for the NAT_TYPE assertions.
+scenario "two private hops, routable public IP: not CGNAT" \
+  none "2+" \
   203.0.113.9 192.168.1.50 "" "" 2 "192.168.1.1 10.0.0.1 62.115.1.1"
 
 scenario "router WAN is RFC1918, differs from observed" \

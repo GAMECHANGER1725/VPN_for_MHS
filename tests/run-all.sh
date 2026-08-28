@@ -6,7 +6,7 @@ set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RC=0
-for SUITE in test-primitives.sh test-cgnat.sh test-report.sh; do
+for SUITE in test-primitives.sh test-cgnat.sh test-report.sh test-ownership.sh; do
   printf '\n=== %s ===\n' "$SUITE"
   bash "$DIR/$SUITE" || RC=1
 done

@@ -45,6 +45,14 @@ Internet ──▶ Home router ──▶ Mac ───────────�
 
 ---
 
+## DECISION 0 — Is the network yours to configure?
+
+Everything below assumes you administer the router. If the audit returns
+`network_ownership: managed`, no other decision matters: on an institutional
+network inbound port forwarding is not available to you, and whether a tunnel
+may cross the network boundary is a policy question for its administrators.
+Re-run the audit on the network the server will actually live on.
+
 ## DECISION 1 — Transport, set by the CGNAT verdict
 
 **`CGNAT: NOT DETECTED`** → IPv4 primary. One UDP port-forward on the router to
@@ -61,7 +69,7 @@ project reports it in the required format — reason, what was attempted, what i
 required, zero-cost alternatives, security implications — and does not fake a
 workaround. Remaining honest paths: ask the ISP for a public IPv4 (often free
 on request); use the VPN LAN-only; or accept a third-party overlay with the
-dependency stated explicitly. See [limitations.md](limitations.md) §3.
+dependency stated explicitly. See [limitations.md](limitations.md) §4.
 
 **`CGNAT: LIKELY`** → resolve before building. Enable UPnP temporarily and
 re-run, or read the router's WAN status page and compare it against the
