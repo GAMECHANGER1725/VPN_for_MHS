@@ -96,12 +96,14 @@ Three things people try, and what they're actually worth:
    *not* a security measure, and it does nothing on a network that blocks UDP
    wholesale.
 
-2. **Tunnelling WireGuard over TCP** (udp2raw, wstunnel and similar). Works
-   sometimes. Costs you real performance — TCP carrying TCP retransmits at two
-   layers and collapses under loss — and adds a moving part outside
-   WireGuard's audited surface. On a network that has deliberately blocked
-   UDP, this is circumventing an administrator's policy rather than solving a
-   technical problem, and this project does not build tooling for that.
+2. **Tunnelling WireGuard over TCP/443** (wstunnel). This project builds this
+   as an opt-in cloak — see [obfuscation.md](obfuscation.md). It wraps
+   WireGuard's UDP in a TLS connection on port 443 so it passes networks that
+   block UDP, while WireGuard stays the security boundary. Two honest costs:
+   real performance loss (TCP carrying a tunnel retransmits at two layers and
+   degrades under loss), and that on a network which deliberately blocks UDP
+   this is getting past an administrator's policy — the AUP consequences are
+   yours, and they land on your account rather than on the code.
 
 3. **A third-party overlay.** Tailscale and ZeroTier relay over TCP/443 when
    UDP fails, which traverses nearly everything. That's option B in
@@ -149,7 +151,10 @@ With this architecture, you get:
 - **Restrictive managed networks:** often not, and that's a property of those
   networks rather than a defect in your setup.
 
-That is what a self-hosted WireGuard VPN can honestly deliver at zero cost.
-"Every network without exception" is not on the menu for any self-hosted
-UDP VPN — only for overlays that relay over TCP/443 through infrastructure
-someone else runs and pays for.
+With the TCP/443 cloak ([obfuscation.md](obfuscation.md)) added, the
+"restrictive managed networks" row moves much closer to working — the cloak is
+built precisely so UDP-blocking networks stop being a wall. The remaining hard
+limit is not the client network any more; it is whether your **home** has a
+reachable address at all. A cloak gets packets out of school; it cannot
+manufacture an inbound path at home if your ISP uses CGNAT. That is the one
+question the home audit still has to answer.

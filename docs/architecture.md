@@ -71,6 +71,13 @@ workaround. Remaining honest paths: ask the ISP for a public IPv4 (often free
 on request); use the VPN LAN-only; or accept a third-party overlay with the
 dependency stated explicitly. See [limitations.md](limitations.md) §4.
 
+**Client-side UDP blocking (any verdict above)** → the TCP/443 cloak
+([obfuscation.md](obfuscation.md)) is the decided answer, built as an opt-in
+layer so the tunnel passes UDP-blocking networks like school. It is orthogonal
+to the CGNAT question: it fixes client egress, not server reachability. If home
+is CGNAT with no IPv6, the cloak cannot help — there is nothing at home to
+reach — and the overlay in limitations.md §4 becomes the only zero-cost path.
+
 **`CGNAT: LIKELY`** → resolve before building. Enable UPnP temporarily and
 re-run, or read the router's WAN status page and compare it against the
 observed public address.

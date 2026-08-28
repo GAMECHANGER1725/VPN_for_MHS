@@ -191,6 +191,7 @@ tests/
   test-report.sh     JSON report emitter
 docs/
   networks.md        Which networks a client can connect from, and why
+  obfuscation.md     The TCP/443 cloak for UDP-blocking networks (school etc.)
   reconnaissance.md  What the audit checks and how to read it
   architecture.md    Draft design, pending audit results
   limitations.md     What this cannot do, stated plainly
@@ -235,6 +236,7 @@ key will ever be committed, logged, or printed unless you explicitly export it.
 | 3 | Minimal working VPN, one client | not started |
 | 4 | Routing / NAT | not started |
 | 5 | DNS | not started |
+| 5b | TCP/443 cloak (wstunnel) for UDP-blocked networks | **designed** ([obfuscation.md](docs/obfuscation.md)); build pending home audit |
 | 6 | Peer management | not started |
 | 7 | CLI | not started |
 | 8 | Monitoring | not started |
