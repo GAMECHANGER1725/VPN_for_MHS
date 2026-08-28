@@ -1,8 +1,13 @@
-# Architecture (DRAFT — contingent on Phase 1 results)
+# Architecture
 
-> This is a proposal, not a built system. The branch points marked **DECISION**
-> resolve once `bin/vpn-doctor` has run on the actual machine. Committing to
-> one now would be guessing.
+> **Pivot:** this document originally proposed a MacBook Air M2 as the VPN
+> server, with the DECISION points below resolved by a `vpn-doctor` audit of
+> the home network. That audit's core question — CGNAT, usable IPv6, router
+> ownership — stopped mattering once the server moved to a small Oracle Cloud
+> "Always Free" VM with its own routable public IP. The sections below are
+> kept for the reasoning they still carry (subnet, DNS, key handling, threat
+> model), with the home-network-specific decisions noted as superseded rather
+> than deleted.
 
 ## Principle
 
@@ -17,18 +22,18 @@ whether a VPN is actually operable six months later.
 ## Data path
 
 ```
-Client                                   MacBook Air M2 (server)
-──────                                   ───────────────────────
-app traffic                              wireguard-go  (userspace, utunN)
+Client                                   Oracle Cloud VM (server)
+──────                                   ────────────────────────
+app traffic                              wireguard (kernel module, wg0)
    │                                          │
    ▼                                          ▼
-WireGuard client                         pf anchor: nat + filter
+WireGuard client                         iptables: nat (MASQUERADE) + filter
    │  ChaCha20-Poly1305                       │
    │  Curve25519 / BLAKE2s                    ▼
-   │  UDP, one port                      net.inet.ip.forwarding = 1
+   │  UDP, one port                      net.ipv4.ip_forward = 1
    ▼                                          │
-Internet ──▶ Home router ──▶ Mac ────────────┘──▶ Home LAN
-             (port-forward)                       Home ISP uplink
+Internet ──▶ OCI Security List ──▶ VM ───────┘──▶ Oracle Cloud uplink
+             (ingress rule)                       reserved public IP
 ```
 
 ## Component boundaries
@@ -36,51 +41,41 @@ Internet ──▶ Home router ──▶ Mac ───────────�
 | Concern | Owner | Why |
 |---|---|---|
 | Key exchange, cipher, handshake | **WireGuard** | Audited. Never reimplemented. |
-| Tunnel interface lifecycle | `wg-quick` + `wireguard-go` | The supported macOS path. |
+| Tunnel interface lifecycle | `wg-quick` + kernel WireGuard | The supported Linux path. |
 | Peer records, IP allocation, key rotation | this project | WireGuard has no notion of a named peer or an address pool. |
-| NAT and forwarding | `pf` anchor + `sysctl` | Isolated so uninstall is exact. |
-| DNS for clients | forwarder on the tunnel address | Keeps resolution inside the home. |
-| Service lifecycle | `launchd` | The correct macOS mechanism. Not a polling loop. |
+| NAT and forwarding | `iptables` + `sysctl` | Isolated rules so uninstall is exact. |
+| Cloud-level ingress | OCI Security List | A second firewall layer in front of the OS's own. |
+| DNS for clients | forwarder on the tunnel address | Keeps resolution off third-party resolvers by default. |
+| Service lifecycle | `systemd` (`wg-quick@wg0`) | The correct Linux mechanism. Not a polling loop. |
 | Diagnostics, health, benchmark | this project | The observability layer. |
 
 ---
 
-## DECISION 0 — Is the network yours to configure?
+## DECISION 0 — Is the network yours to configure? (superseded)
 
-Everything below assumes you administer the router. If the audit returns
-`network_ownership: managed`, no other decision matters: on an institutional
-network inbound port forwarding is not available to you, and whether a tunnel
-may cross the network boundary is a policy question for its administrators.
-Re-run the audit on the network the server will actually live on.
+This assumed a home router you administer, with inbound port forwarding as the
+gating question. It doesn't apply to a cloud VM: the VM has a directly
+routable public IP and an OCI Security List you configure yourself through the
+Oracle Cloud Console, not a home router. `vpn-doctor`'s network-ownership audit
+remains useful for the separate *client*-side question — is the network a
+device is connecting *from* one that blocks outbound UDP — see
+[docs/networks.md](networks.md).
 
-## DECISION 1 — Transport, set by the CGNAT verdict
+## DECISION 1 — Transport (superseded)
 
-**`CGNAT: NOT DETECTED`** → IPv4 primary. One UDP port-forward on the router to
-the Mac's LAN address, plus a DHCP reservation so that address is stable. IPv6
-added as a second endpoint if the audit reports it `candidate`.
+The original branch (NOT DETECTED / CONFIRMED+candidate / CONFIRMED+unusable /
+LIKELY) existed entirely to route around home-network CGNAT and router
+port-forwarding. An Oracle Cloud VM has a public IPv4 address by default —
+reserved, in this project's case, so it never changes — with no NAT to
+traverse and no ISP to negotiate with. Transport is simply: WireGuard over
+UDP, one configurable port (default `51820`), opened in both the OCI Security
+List and the VM's own `iptables`.
 
-**`CGNAT: CONFIRMED` + IPv6 `candidate`** → IPv6-only inbound. Works, with a
-hard caveat: clients on IPv4-only networks (most hotels, most cafés, some
-carriers) cannot connect at all. Documented as a partial solution, never as a
-complete one.
-
-**`CGNAT: CONFIRMED` + IPv6 `unusable`** → **BLOCKED** for direct inbound. The
-project reports it in the required format — reason, what was attempted, what is
-required, zero-cost alternatives, security implications — and does not fake a
-workaround. Remaining honest paths: ask the ISP for a public IPv4 (often free
-on request); use the VPN LAN-only; or accept a third-party overlay with the
-dependency stated explicitly. See [limitations.md](limitations.md) §4.
-
-**Client-side UDP blocking (any verdict above)** → the TCP/443 cloak
-([obfuscation.md](obfuscation.md)) is the decided answer, built as an opt-in
-layer so the tunnel passes UDP-blocking networks like school. It is orthogonal
-to the CGNAT question: it fixes client egress, not server reachability. If home
-is CGNAT with no IPv6, the cloak cannot help — there is nothing at home to
-reach — and the overlay in limitations.md §4 becomes the only zero-cost path.
-
-**`CGNAT: LIKELY`** → resolve before building. Enable UPnP temporarily and
-re-run, or read the router's WAN status page and compare it against the
-observed public address.
+**Client-side UDP blocking still applies** and is unaffected by where the
+server lives: the TCP/443 cloak ([obfuscation.md](obfuscation.md)) remains the
+decided answer for networks (school, some corporate Wi-Fi) that block outbound
+UDP for the *client*. It fixes client egress, not server reachability, and
+those are independent problems.
 
 ## DECISION 2 — VPN subnet
 
@@ -92,13 +87,13 @@ random RFC 4193 ULA `/64`, generated once at install and then fixed.
 ## DECISION 3 — DNS
 
 Default target: a resolver reachable **only** on the tunnel address, forwarding
-to whatever the Mac itself uses. No commercial provider is required or
-hard-coded; the choice is configuration.
+to a public resolver from the VM itself (e.g. `1.1.1.1`) rather than to
+whatever a home router happened to hand out. No commercial provider is
+required or hard-coded; the choice is configuration.
 
-**DECISION**: whether to run a local forwarder (`dnsmasq`/`unbound` via
-Homebrew, more moving parts, better control) or point clients directly at the
-router's resolver through the tunnel (simpler, fewer failure modes). Resolved
-by what the audit finds in section 5.
+**DECISION**: run a local forwarder (`dnsmasq`/`unbound`) on the VM, bound to
+the tunnel address only — a cloud VM has no home-router resolver to defer to,
+so this is now the only sensible default rather than one branch of a choice.
 
 Leak prevention is client-side and platform-specific, and will be documented
 per platform rather than presented as one uniform recipe — because it isn't
@@ -106,10 +101,12 @@ one.
 
 ## DECISION 4 — IPv6 inside the tunnel
 
-Advertised **only** if the audit reports `candidate`. `partial` is not enough.
-A tunnel that advertises `::/0` over a broken IPv6 path blackholes client
-traffic, which is worse than no IPv6 at all. Where IPv6 is unusable, client
-configs get explicit leak prevention instead of silence.
+Advertised only once the VM's own IPv6 reachability (Oracle Cloud VMs get
+IPv6 only if the VCN/subnet is configured for it) is confirmed working
+end-to-end. Not assumed just because the VM has a public IPv4. A tunnel that
+advertises `::/0` over a broken IPv6 path blackholes client traffic, which is
+worse than no IPv6 at all. Until confirmed, client configs get explicit IPv6
+leak prevention instead of silence.
 
 ---
 
@@ -117,29 +114,37 @@ configs get explicit leak prevention instead of silence.
 
 ```
 bin/
-  vpn                 single CLI entry point
-  vpn-doctor          ✅ built
+  vpn                 single CLI entry point (currently macOS-only; needs a
+                       Linux backend — pf/launchd calls swapped for
+                       iptables/systemd — before it can drive the Oracle VM)
+  vpn-doctor          ✅ built (macOS client/network audit)
   upnp-wan-ip.py      ✅ built
 lib/
-  config.sh  peers.sh  keys.sh  net.sh  pf.sh  dns.sh  health.sh
+  config.sh  peers.sh  keys.sh  net.sh  iptables.sh  dns.sh  health.sh
 config/             chmod 700, gitignored
   server.conf  network.conf  dns.conf
   peers/<name>.json   metadata only — never private keys
 state/              runtime: allocations, last-known public IP
   keys/             chmod 700, files chmod 600
-launchd/
-  com.vpnformhs.server.plist
-  com.vpnformhs.health.plist
-pf/
-  vpnformhs.anchor    our rules, loaded into a named anchor
+systemd/
+  wg-quick@wg0 (built into wireguard-tools) + a health-check unit/timer
+iptables/
+  vpnformhs.rules     our NAT + filter rules, restored via netfilter-persistent
 tests/
 docs/
 ```
 
-Bash, because every operation is shelling out to `wg`, `pfctl`, `route`,
-`scutil` and `networksetup` anyway, and a second language would add a
+Bash, because every operation is shelling out to `wg`, `iptables`,
+`ip`/`route` and `systemctl` anyway, and a second language would add a
 dependency without removing a subprocess. If peer state outgrows JSON files,
 that is the point to reconsider — not before.
+
+The initial Oracle VM setup in this pivot was done by hand over SSH (Phase 3)
+rather than through `bin/vpn`, precisely because that CLI's platform layer is
+still macOS-only. Bringing `bin/vpn` up to parity with what was done by hand —
+so the *next* server, or a rebuild of this one, goes through the project's own
+tested key/peer code instead of ad hoc shell commands — is tracked as its own
+follow-up, not bundled into getting the first tunnel working.
 
 ## CLI surface
 

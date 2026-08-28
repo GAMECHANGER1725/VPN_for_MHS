@@ -1,35 +1,44 @@
 # VPN for MHS
 
-A zero-cost, self-hosted WireGuard VPN where a MacBook Air M2 is the server.
+A self-hosted WireGuard VPN running on a free-tier Oracle Cloud VM.
 
-> **Project status: Phase 1 (Reconnaissance) — instrument delivered, audit not yet run.**
+> **Project status: Phase 3 (Minimal working VPN) — in progress on Oracle Cloud.**
 >
-> No VPN has been installed. No system setting has been changed. What exists
-> today is the diagnostic that decides whether this project is viable at all,
-> and the honest documentation of what it can and cannot do.
+> The original design ran the server on a MacBook Air M2, on the theory that
+> zero-cost meant no cloud component. Phase 1 reconnaissance on the home
+> network, plus the practical reality of keeping a laptop always-on and
+> reachable, made a small free-tier cloud VM the better trade: still zero
+> recurring cost, but always-on and directly reachable with no CGNAT, no
+> port-forwarding, and no dependency on a laptop staying awake. See
+> [docs/architecture.md](docs/architecture.md) for the full reasoning and the
+> decision points that led here.
 
 ---
 
 ## The three sentences that matter
 
-**Your Mac is the VPN server.** There is no cloud component, no VPS, no
-provider. When you connect from your phone, your phone is talking to your
-MacBook.
+**A small Oracle Cloud VM is the VPN server.** It is a real, always-on Linux
+host with its own public IP — not a laptop pretending to be a server, and not
+dependent on your home network's reachability.
 
-**Your home Internet connection is the VPN's Internet connection.** Full-tunnel
-traffic exits through your home ISP, at your home upload speed, from your home
-IP address.
+**The server's own uplink is the VPN's Internet connection.** Full-tunnel
+traffic exits through Oracle's network, at the cloud provider's speed, from
+the server's public IP — not your home IP.
 
-**If the Mac is offline, the VPN is offline.** Asleep, lid closed, carried out
-of the house, off Wi-Fi — the VPN is down. A MacBook Air is not a server, and
-this project will not pretend otherwise.
+**If the server is down, the VPN is down.** That is now Oracle's uptime, not
+your laptop's lid state — a meaningfully different (and much smaller) failure
+mode than the original MacBook design, but still worth stating plainly.
 
-A fourth sentence may also apply, and Phase 1 exists to find out:
+The Phase 1 finding that started this pivot:
 
-**If your ISP uses carrier-grade NAT and you have no usable public IPv6,
-direct inbound access to your home is impossible** — not difficult, not a
-matter of finding the right router setting. Impossible. See
-[docs/limitations.md](docs/limitations.md).
+**Home network reachability was the open question, and it no longer has to be
+answered.** Whether the home ISP uses carrier-grade NAT, and whether IPv6 was
+usable, mattered a great deal when the plan was to open a port on a home
+router. It stops mattering once the server lives somewhere with a routable
+public IP by default. See [docs/limitations.md](docs/limitations.md) for what
+still applies (this project still owns no cryptography and no protocol — that
+part never changed) and [docs/architecture.md](docs/architecture.md) for what
+the Oracle Cloud free tier does and doesn't guarantee.
 
 ---
 
@@ -75,9 +84,10 @@ Exit codes: `0` clean, `1` one or more BLOCK findings, `2` bad usage,
 
 ### Checking a network you're standing on
 
-The audit above profiles the machine that will *host* the server. A different
-question — "can a WireGuard client connect from this café / school / hotel?" —
-gets its own fast check:
+`vpn-doctor` still audits a macOS machine's own reachability, which no longer
+decides where the server lives — but it remains the fast answer to a question
+that still matters: "can a WireGuard *client* connect from this café / school
+/ hotel?"
 
 ```sh
 bin/vpn-doctor --client-check
@@ -155,14 +165,13 @@ one, and the tool must not accuse a residential network of being institutional.
   Internet
       |
       v
-  Home router          <- inbound UDP port-forward (IPv4)
-      |                   or inbound v6 firewall rule (IPv6)
+  Oracle Cloud VM (Ubuntu, Always Free tier)
+      |   reserved public IPv4
+      |   wireguard (kernel module) on wg0
+      |   iptables NAT + Security List ingress rule, UDP/51820
+      |   net.ipv4.ip_forward = 1
       v
-  MacBook Air M2       <- wireguard-go on utunN
-      |                   pf NAT in a dedicated anchor
-      |                   net.inet.ip.forwarding = 1
-      v
-  Home LAN  +  Home ISP uplink
+  Oracle Cloud uplink  ->  rest of the Internet
 ```
 
 WireGuard owns the cryptography. This project owns everything around it:
@@ -170,8 +179,8 @@ configuration, peer and key lifecycle, routing, DNS, firewall, diagnostics,
 monitoring, automation and backup. **No custom cryptography, no custom
 protocol** — those are non-goals, permanently.
 
-Draft design and the decision points that depend on your audit result:
-[docs/architecture.md](docs/architecture.md).
+Full design, including how this pivoted away from the original Mac-as-server
+plan: [docs/architecture.md](docs/architecture.md).
 
 ---
 
@@ -193,7 +202,7 @@ docs/
   networks.md        Which networks a client can connect from, and why
   obfuscation.md     The TCP/443 cloak for UDP-blocking networks (school etc.)
   reconnaissance.md  What the audit checks and how to read it
-  architecture.md    Draft design, pending audit results
+  architecture.md    Design, including the Mac -> Oracle Cloud server pivot
   limitations.md     What this cannot do, stated plainly
 reports/            Audit output (gitignored)
 ```
@@ -231,12 +240,12 @@ key will ever be committed, logged, or printed unless you explicitly export it.
 
 | Phase | | |
 |---|---|---|
-| 1 | Reconnaissance | instrument ready; **first real audit ran on a managed network — needs a re-run at home** |
-| 2 | Architecture | draft, blocked on Phase 1 result |
-| 3 | Minimal working VPN, one client | not started |
+| 1 | Reconnaissance | superseded — home network reachability no longer gates the design once the server is cloud-hosted |
+| 2 | Architecture | **decided: Oracle Cloud Always Free VM is the server**, see docs/architecture.md |
+| 3 | Minimal working VPN, one client | in progress |
 | 4 | Routing / NAT | not started |
 | 5 | DNS | not started |
-| 5b | TCP/443 cloak (wstunnel) for UDP-blocked networks | **designed** ([obfuscation.md](docs/obfuscation.md)); build pending home audit |
+| 5b | TCP/443 cloak (wstunnel) for UDP-blocked networks | **designed** ([obfuscation.md](docs/obfuscation.md)); build not started |
 | 6 | Peer management | not started |
 | 7 | CLI | not started |
 | 8 | Monitoring | not started |
