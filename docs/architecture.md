@@ -142,19 +142,25 @@ the page and the thing running the command are on the same machine. It is
 not, and must never become, part of the public-facing site discussed for
 sharing access with other people; that is a separate, unbuilt piece of work.
 
-It runs `wg-quick` via `sudo -n` (non-interactive) so it can act
+It runs `wg-quick` and `wg` via `sudo -n` (non-interactive) so it can act
 instantly on a click rather than blocking on a password prompt from a
 background process. That requires a narrowly-scoped passwordless-sudo
-grant for the exact two commands, added via a dedicated file in
+grant for the exact commands below, added via a dedicated file in
 `/etc/sudoers.d/` (never edit `/etc/sudoers` directly) and validated with
 `visudo -c` before trusting it:
 
 ```
-<user> ALL=(root) NOPASSWD: <path to wg-quick> up <home>/.wireguard/laptop.conf, <path to wg-quick> down <home>/.wireguard/laptop.conf
+<user> ALL=(root) NOPASSWD: <path to wg-quick> up <home>/.wireguard/laptop.conf, <path to wg-quick> down <home>/.wireguard/laptop.conf, <path to wg> show all dump, /bin/cat /var/run/wireguard/laptop.name
 ```
 
-Scoped to those two exact command lines — not `wg-quick` in general, and
-not root access in general.
+Scoped to those exact command lines — not `wg-quick` or `wg` in general,
+and not root access in general. The last one exists because `wg-quick`
+creates `/var/run/wireguard/<name>.name` (the friendly-name → real
+`utunN` mapping) as root, so an unprivileged process can see that the
+file exists but cannot read its contents without this grant — a plain
+`open()` on it raises `PermissionError` even though `os.path.exists()`
+on the same path succeeds, since existence only needs directory search
+permission while reading the contents needs the file's own read bit.
 
 ---
 
