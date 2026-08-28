@@ -77,6 +77,29 @@ decided answer for networks (school, some corporate Wi-Fi) that block outbound
 UDP for the *client*. It fixes client egress, not server reachability, and
 those are independent problems.
 
+**Found during the first real client test**: Oracle's default Ubuntu image
+ships a `FORWARD` chain with policy `ACCEPT` but a single catch-all `REJECT`
+rule at the top — the same pattern the image uses on `INPUT` for SSH. That
+rule blocks all routed traffic, `INPUT`'s own allow-list does nothing for it,
+and the symptom is confusing: the WireGuard handshake succeeds, the tunnel's
+own address is pingable, but anything beyond it (`1.1.1.1`, the open internet)
+comes back `ICMP administratively prohibited` from the server itself. Fixed
+by inserting, above the `REJECT` line: `iptables -I FORWARD 1 -i wg0 -j
+ACCEPT` and `iptables -I FORWARD 2 -o wg0 -m state --state
+RELATED,ESTABLISHED -j ACCEPT`, then `netfilter-persistent save`. Anyone
+rebuilding this box needs both the `INPUT` fix (for reaching the server) and
+this `FORWARD` fix (for the server routing traffic onward) — they are two
+separate chains and neither implies the other.
+
+**Also worth knowing**: `wg-quick`'s full-tunnel mode on macOS replaces the
+client's entire default route (via two `/1` routes) and rewrites DNS on every
+network service the machine has, not just the active one. With the `FORWARD`
+bug above still in place, that meant a client with no working route to
+anywhere and no automatic recovery — worth testing a new server with a
+restricted `AllowedIPs` (just the server's tunnel address, then a single
+external IP) before ever trying `0.0.0.0/0`, so a forwarding bug can't take
+the whole client offline.
+
 ## DECISION 2 — VPN subnet
 
 Taken from the audit's conflict scan rather than hard-coded. Checked against

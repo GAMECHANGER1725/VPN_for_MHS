@@ -242,7 +242,7 @@ key will ever be committed, logged, or printed unless you explicitly export it.
 |---|---|---|
 | 1 | Reconnaissance | superseded — home network reachability no longer gates the design once the server is cloud-hosted |
 | 2 | Architecture | **decided: Oracle Cloud Always Free VM is the server**, see docs/architecture.md |
-| 3 | Minimal working VPN, one client | in progress |
+| 3 | Minimal working VPN, one client | **done** — full-tunnel verified end-to-end from a Mac client |
 | 4 | Routing / NAT | not started |
 | 5 | DNS | not started |
 | 5b | TCP/443 cloak (wstunnel) for UDP-blocked networks | **designed** ([obfuscation.md](docs/obfuscation.md)); build not started |
