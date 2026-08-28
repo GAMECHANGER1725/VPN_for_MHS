@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# SECRETS — these patterns exist from commit #1 on purpose.
+# Nothing matching these may ever enter git history.
+# ---------------------------------------------------------------------------
+
+# WireGuard keys and anything key-shaped
+*.key
+*.privkey
+*.pubkey
+*.psk
+privatekey
+preshared*
+*.pem
+
+# Generated WireGuard configs (contain PrivateKey= lines)
+*.conf
+!**/*.example.conf
+!**/*.template.conf
+
+# Live runtime state
+config/
+state/
+peers/
+secrets/
+backups/
+
+# ---------------------------------------------------------------------------
+# DIAGNOSTIC REPORTS
+# vpn-doctor output contains your public IP, LAN addressing, MAC addresses and
+# ISP topology. That is not a secret in the cryptographic sense, but it is
+# personally identifying and does not belong in a public repository.
+# ---------------------------------------------------------------------------
+reports/*
+!reports/.gitkeep
+
+# QR codes render a full client config, private key included.
+*.qr.png
+*.qr.txt
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+.DS_Store
+*.log
+*.bak
+*.tmp
+*.swp
+.vpn-doctor-cache/

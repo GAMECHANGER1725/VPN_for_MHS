@@ -1,0 +1,1173 @@
+#!/usr/bin/env bash
+#
+# vpn-doctor — Phase 1 reconnaissance for the macOS WireGuard server project.
+#
+# READ-ONLY BY DESIGN.
+#   This script does not modify sysctls, pf rules, routes, DNS, power settings,
+#   launchd jobs or any file outside the report directory you point it at.
+#   Every command it runs is an inspection command. You are encouraged to read
+#   it before running it; that is the point of Phase 1.
+#
+# Network egress:
+#   By default it makes a small number of outbound HTTPS/ICMP/UDP requests to
+#   determine public reachability. Every endpoint is listed in ENDPOINTS below
+#   and can be overridden. Use --offline to make zero external requests.
+#
+# Usage:
+#   bin/vpn-doctor                      human-readable report
+#   bin/vpn-doctor --json               machine-readable report to stdout
+#   bin/vpn-doctor --save               write report to reports/ (gitignored)
+#   bin/vpn-doctor --with-sudo          also inspect pf (prompts for password)
+#   bin/vpn-doctor --offline            no external network requests
+#   bin/vpn-doctor --fast               skip slow probes (traceroute, profiler)
+#
+set -uo pipefail
+
+VERSION="0.1.0-phase1"
+
+# --------------------------------------------------------------------------
+# External endpoints (all free, all overridable, all disclosed)
+# --------------------------------------------------------------------------
+: "${IPV4_ECHO_URL:=https://api.ipify.org}"
+: "${IPV6_ECHO_URL:=https://api6.ipify.org}"
+: "${PING4_TARGET:=1.1.1.1}"
+: "${PING6_TARGET:=2606:4700:4700::1111}"
+: "${TRACE_TARGET:=1.1.1.1}"
+: "${DNS_TEST_NAME:=example.com}"
+
+# --------------------------------------------------------------------------
+# Options
+# --------------------------------------------------------------------------
+OPT_JSON=0
+OPT_SAVE=0
+OPT_SUDO=0
+OPT_OFFLINE=0
+OPT_FAST=0
+OPT_NOCOLOR=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)      OPT_JSON=1 ;;
+    --save)      OPT_SAVE=1 ;;
+    --with-sudo) OPT_SUDO=1 ;;
+    --offline)   OPT_OFFLINE=1 ;;
+    --fast)      OPT_FAST=1 ;;
+    --no-color)  OPT_NOCOLOR=1 ;;
+    -h|--help)
+      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *)
+      echo "vpn-doctor: unknown option '$1' (try --help)" >&2
+      exit 2 ;;
+  esac
+  shift
+done
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+if [ -t 1 ] && [ "$OPT_NOCOLOR" -eq 0 ] && [ -z "${NO_COLOR:-}" ] && [ "$OPT_JSON" -eq 0 ]; then
+  C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
+  C_BLU=$'\033[34m'; C_CYN=$'\033[36m'
+else
+  C_RST=""; C_B=""; C_DIM=""; C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_CYN=""
+fi
+
+# Everything human-readable goes to stdout unless --json, in which case the
+# narrative is suppressed and only JSON is emitted.
+say() { [ "$OPT_JSON" -eq 1 ] || printf '%s\n' "$*"; }
+hdr() { [ "$OPT_JSON" -eq 1 ] || printf '\n%s%s%s\n%s\n' "$C_B$C_BLU" "$*" "$C_RST" "$(printf '%.0s─' $(seq 1 ${#1}))"; }
+kv()  { [ "$OPT_JSON" -eq 1 ] || printf '  %-26s %s\n' "$1" "$2"; }
+note(){ [ "$OPT_JSON" -eq 1 ] || printf '  %s%s%s\n' "$C_DIM" "$*" "$C_RST"; }
+
+# --------------------------------------------------------------------------
+# Fact + finding collection
+#   FACTS is a flat key=value store, emitted as JSON at the end.
+#   FINDINGS carries severity-tagged observations that drive the verdict.
+# --------------------------------------------------------------------------
+FACT_KEYS=()
+FACT_VALS=()
+FACT_N=0
+FINDINGS=()          # "LEVEL|CODE|message|action"
+FINDINGS_N=0
+HAS_CRITICAL=0
+HAS_WARN=0
+
+# NOTE ON BASH 3.2
+#   macOS ships bash 3.2 as /bin/bash. Under `set -u`, bash 3.2 treats
+#   ${#arr[@]} and "${arr[@]}" on an *empty* array as an unbound-variable
+#   error. We therefore track lengths in explicit counters and never expand a
+#   possibly-empty array without a guard. Do not "simplify" this away.
+
+fact() {  # fact <key> <value>
+  FACT_KEYS[$FACT_N]="$1"
+  FACT_VALS[$FACT_N]="${2:-}"
+  FACT_N=$(( FACT_N + 1 ))
+}
+
+finding() {  # finding <LEVEL> <CODE> <message> [action]
+  FINDINGS[$FINDINGS_N]="$1|$2|$3|${4:-}"
+  FINDINGS_N=$(( FINDINGS_N + 1 ))
+  case "$1" in
+    BLOCK) HAS_CRITICAL=1 ;;
+    WARN)  HAS_WARN=1 ;;
+  esac
+}
+
+json_escape() {
+  # Escape a string for embedding in JSON.
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+emit_json() {
+  printf '{\n'
+  local i n="$FACT_N"
+  for ((i=0; i<n; i++)); do
+    printf '  "%s": "%s",\n' "$(json_escape "${FACT_KEYS[$i]}")" "$(json_escape "${FACT_VALS[$i]}")"
+  done
+  printf '  "findings": [\n'
+  local j m="$FINDINGS_N"
+  for ((j=0; j<m; j++)); do
+    IFS='|' read -r L CODE MSG ACT <<< "${FINDINGS[$j]}"
+    printf '    {"level": "%s", "code": "%s", "message": "%s", "action": "%s"}' \
+      "$(json_escape "$L")" "$(json_escape "$CODE")" "$(json_escape "$MSG")" "$(json_escape "$ACT")"
+    [ $((j+1)) -lt "$m" ] && printf ','
+    printf '\n'
+  done
+  printf '  ]\n}\n'
+}
+
+# --------------------------------------------------------------------------
+# IPv4 / CIDR arithmetic (pure bash, no dependencies)
+# --------------------------------------------------------------------------
+ip4_to_int() {
+  local IFS=. a b c d
+  read -r a b c d <<< "$1" || return 1
+  [ -n "${d:-}" ] || return 1
+  printf '%s' $(( (a<<24) + (b<<16) + (c<<8) + d ))
+}
+
+ip4_in_cidr() {  # ip4_in_cidr <ip> <cidr>
+  local ip="$1" cidr="$2" net bits ipi neti mask
+  net="${cidr%%/*}"; bits="${cidr##*/}"
+  ipi=$(ip4_to_int "$ip")   || return 1
+  neti=$(ip4_to_int "$net") || return 1
+  [ "$bits" -eq 0 ] && return 0
+  mask=$(( 0xFFFFFFFF << (32 - bits) & 0xFFFFFFFF ))
+  [ $(( ipi & mask )) -eq $(( neti & mask )) ]
+}
+
+is_rfc1918() {
+  ip4_in_cidr "$1" 10.0.0.0/8      && return 0
+  ip4_in_cidr "$1" 172.16.0.0/12   && return 0
+  ip4_in_cidr "$1" 192.168.0.0/16  && return 0
+  return 1
+}
+
+is_cgnat() { ip4_in_cidr "$1" 100.64.0.0/10; }
+
+is_special4() {
+  is_rfc1918 "$1"                  && return 0
+  is_cgnat "$1"                    && return 0
+  ip4_in_cidr "$1" 127.0.0.0/8     && return 0
+  ip4_in_cidr "$1" 169.254.0.0/16  && return 0
+  ip4_in_cidr "$1" 0.0.0.0/8       && return 0
+  return 1
+}
+
+hexmask_to_prefix() {  # 0xffffff00 -> 24
+  local m="${1#0x}" n=0 i byte
+  for i in 0 2 4 6; do
+    byte=$(( 16#${m:$i:2} ))
+    while [ $byte -gt 0 ]; do n=$(( n + (byte & 1) )); byte=$(( byte >> 1 )); done
+  done
+  printf '%s' "$n"
+}
+
+cidr_overlap() {  # cidr_overlap <a> <b>
+  local an="${1%%/*}" ab="${1##*/}" bn="${2%%/*}" bb="${2##*/}" short
+  short=$(( ab < bb ? ab : bb ))
+  local m=$(( 0xFFFFFFFF << (32 - short) & 0xFFFFFFFF ))
+  local ai bi
+  ai=$(ip4_to_int "$an") || return 1
+  bi=$(ip4_to_int "$bn") || return 1
+  [ $(( ai & m )) -eq $(( bi & m )) ]
+}
+
+# --------------------------------------------------------------------------
+# classify_cgnat — decide whether a carrier-grade NAT sits between this
+# machine and the Internet.
+#
+#   classify_cgnat <observed_pub4> <lan_ip4> <router_wan> \
+#                  <cgnat_hop> <private_hop_count> <trace_hops>
+#
+# Sets: CGNAT_STATE   none | likely | confirmed | unknown
+#       CGNAT_EVIDENCE  human-readable reasoning, always shown to the user
+#       NAT_LAYERS      0 | 1 | 2+ | unknown
+#
+# "confirmed" requires either a definitionally conclusive signal (the address
+# the Internet sees is itself unroutable) or two independent agreeing signals.
+# A single suggestive signal only earns "likely". The evidence string is always
+# printed so the reasoning can be checked rather than trusted.
+# --------------------------------------------------------------------------
+classify_cgnat() {
+  local pub4="${1:-}" lan4="${2:-}" rwan="${3:-}"
+  local cgnat_hop="${4:-}" priv_hops="${5:-0}" trace="${6:-}"
+
+  CGNAT_STATE="unknown"
+  CGNAT_EVIDENCE=""
+  NAT_LAYERS="unknown"
+
+  add_ev() { CGNAT_EVIDENCE="${CGNAT_EVIDENCE}${CGNAT_EVIDENCE:+; }$1"; }
+
+  # Signal 1: is the address the Internet sees actually routable?
+  if [ -n "$pub4" ]; then
+    if is_cgnat "$pub4"; then
+      CGNAT_STATE="confirmed"
+      add_ev "the address the Internet sees ($pub4) is itself inside 100.64.0.0/10, which is not globally routable"
+    elif is_special4 "$pub4"; then
+      CGNAT_STATE="confirmed"
+      add_ev "the address the Internet sees ($pub4) is a reserved/private range and cannot accept inbound traffic"
+    fi
+  fi
+
+  # Signal 2: does the path out cross a carrier NAT hop?
+  if [ -n "$cgnat_hop" ]; then
+    add_ev "traceroute crosses a carrier-grade NAT hop at $cgnat_hop (100.64.0.0/10)"
+    [ "$CGNAT_STATE" = "unknown" ] && CGNAT_STATE="confirmed"
+  fi
+
+  # Signal 3: does the router agree with the Internet about its own address?
+  if [ -n "$rwan" ] && [ -n "$pub4" ]; then
+    if [ "$rwan" = "$pub4" ]; then
+      add_ev "the router's WAN address equals the address the Internet sees, so there is no NAT above your router"
+      [ "$CGNAT_STATE" = "unknown" ] && CGNAT_STATE="none"
+      NAT_LAYERS="1"
+    else
+      add_ev "the router believes its WAN address is $rwan but the Internet sees $pub4, so at least one NAT sits above your router"
+      CGNAT_STATE="confirmed"
+      NAT_LAYERS="2+"
+    fi
+  fi
+
+  # Weak signal: several private hops before the first routable one.
+  if [ "$CGNAT_STATE" = "unknown" ] && [ "$priv_hops" -ge 2 ]; then
+    CGNAT_STATE="likely"
+    add_ev "$priv_hops consecutive private hops at the network edge suggests double NAT"
+    NAT_LAYERS="2+"
+  fi
+
+  # Clean single-NAT case.
+  if [ "$CGNAT_STATE" = "unknown" ] && [ -n "$pub4" ] && [ "$priv_hops" -le 1 ] && [ -n "$trace" ]; then
+    CGNAT_STATE="none"
+    add_ev "a single private hop (your router) precedes globally routable hops, and the observed public address is routable"
+    NAT_LAYERS="1"
+  fi
+
+  # No NAT at all: this machine holds the public address.
+  if [ -n "$pub4" ] && [ "$pub4" = "$lan4" ]; then
+    add_ev "this Mac holds the public address directly — there is no NAT at all"
+    CGNAT_STATE="none"; NAT_LAYERS="0"
+  fi
+}
+
+# IPv6 classification by textual prefix (sufficient for our purposes)
+v6_class() {
+  local a; a=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  case "$a" in
+    ::1)          echo loopback ;;
+    fe80:*)       echo link-local ;;
+    f[cd]*)       echo ula ;;
+    2*|3*)        echo global ;;
+    *)            echo other ;;
+  esac
+}
+
+# --------------------------------------------------------------------------
+# Test hook: `VPN_DOCTOR_LIB_ONLY=1 source bin/vpn-doctor` defines the pure
+# helper functions above and stops, so they can be unit tested off-macOS.
+# --------------------------------------------------------------------------
+if [ "${VPN_DOCTOR_LIB_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+# ==========================================================================
+# 0. PLATFORM GUARD
+# ==========================================================================
+UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
+if [ "$UNAME_S" != "Darwin" ]; then
+  cat >&2 <<EOF
+vpn-doctor: this diagnostic is macOS-specific and will not produce a valid
+report on $UNAME_S.
+
+Every probe below depends on macOS tooling (sw_vers, scutil, networksetup,
+pmset, pfctl, ipconfig). Running it elsewhere would produce a report that
+looks real and is not, which defeats the purpose.
+
+Run this on the MacBook Air M2 that is intended to be the VPN server.
+EOF
+  exit 3
+fi
+
+say "${C_B}vpn-doctor${C_RST} ${C_DIM}v${VERSION}${C_RST}  ${C_DIM}(read-only; modifies nothing)${C_RST}"
+say "${C_DIM}$(date '+%Y-%m-%d %H:%M:%S %Z')${C_RST}"
+[ "$OPT_OFFLINE" -eq 1 ] && say "${C_DIM}offline mode: no external requests will be made${C_RST}"
+
+fact schema_version "1"
+fact doctor_version "$VERSION"
+fact generated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+fact offline_mode "$OPT_OFFLINE"
+
+# ==========================================================================
+# 1. SYSTEM
+# ==========================================================================
+hdr "SYSTEM"
+
+OS_NAME="$(sw_vers -productName 2>/dev/null)"
+OS_VER="$(sw_vers -productVersion 2>/dev/null)"
+OS_BUILD="$(sw_vers -buildVersion 2>/dev/null)"
+ARCH="$(uname -m 2>/dev/null)"
+CPU_BRAND="$(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+NCPU="$(sysctl -n hw.ncpu 2>/dev/null)"
+MEM_BYTES="$(sysctl -n hw.memsize 2>/dev/null)"
+IS_ARM64="$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)"
+
+MODEL_ID=""
+if [ "$OPT_FAST" -eq 0 ] && have system_profiler; then
+  MODEL_ID="$(system_profiler SPHardwareDataType 2>/dev/null \
+    | awk -F': ' '/Model Identifier/{print $2; exit}')"
+fi
+
+OS_MAJOR="${OS_VER%%.*}"
+
+kv "macOS"            "${OS_NAME:-?} ${OS_VER:-?} (${OS_BUILD:-?})"
+kv "Model"            "${MODEL_ID:-not probed}"
+kv "CPU"              "${CPU_BRAND:-?}"
+kv "Architecture"     "${ARCH:-?}$([ "$IS_ARM64" = "1" ] && echo "  (Apple Silicon)")"
+kv "Cores"            "${NCPU:-?}"
+kv "Memory"           "$([ -n "$MEM_BYTES" ] && echo "$(( MEM_BYTES / 1024 / 1024 / 1024 )) GB" || echo '?')"
+
+fact os_name "$OS_NAME";        fact os_version "$OS_VER"
+fact os_build "$OS_BUILD";      fact os_major "$OS_MAJOR"
+fact arch "$ARCH";              fact apple_silicon "$IS_ARM64"
+fact cpu_brand "$CPU_BRAND";    fact model_identifier "$MODEL_ID"
+fact ncpu "$NCPU";              fact mem_bytes "$MEM_BYTES"
+
+if [ "$IS_ARM64" != "1" ]; then
+  finding WARN ARCH_NOT_ARM64 \
+    "This machine does not report Apple Silicon (arch=$ARCH)." \
+    "The project targets an M2 MacBook Air. Homebrew paths and wireguard-go performance assumptions may differ."
+fi
+if [ -n "$OS_MAJOR" ] && [ "$OS_MAJOR" -lt 13 ] 2>/dev/null; then
+  finding WARN OS_OLD \
+    "macOS $OS_VER is older than 13 (Ventura)." \
+    "Homebrew formulae and pf behaviour are validated against newer releases; expect drift."
+fi
+
+# ==========================================================================
+# 2. TOOLING
+# ==========================================================================
+hdr "TOOLING"
+
+BREW_BIN=""; BREW_PREFIX=""; BREW_VER=""
+if have brew; then
+  BREW_BIN="$(command -v brew)"
+  BREW_PREFIX="$(brew --prefix 2>/dev/null)"
+  BREW_VER="$(brew --version 2>/dev/null | head -1)"
+fi
+
+WG_BIN="$(command -v wg 2>/dev/null)"
+WGQ_BIN="$(command -v wg-quick 2>/dev/null)"
+WGGO_BIN="$(command -v wireguard-go 2>/dev/null)"
+QR_BIN="$(command -v qrencode 2>/dev/null)"
+PY3_BIN="$(command -v python3 2>/dev/null)"
+XCLT="$(xcode-select -p 2>/dev/null)"
+
+WG_VER=""; [ -n "$WG_BIN" ] && WG_VER="$("$WG_BIN" --version 2>/dev/null)"
+WGGO_VER=""; [ -n "$WGGO_BIN" ] && WGGO_VER="$("$WGGO_BIN" --version 2>/dev/null | head -1)"
+
+kv "Homebrew"       "${BREW_VER:-NOT INSTALLED}"
+[ -n "$BREW_PREFIX" ] && kv "  prefix"      "$BREW_PREFIX"
+kv "wg"             "${WG_VER:-NOT INSTALLED}"
+kv "wg-quick"       "${WGQ_BIN:-NOT INSTALLED}"
+kv "wireguard-go"   "${WGGO_VER:-${WGGO_BIN:-NOT INSTALLED}}"
+kv "qrencode"       "${QR_BIN:-NOT INSTALLED (optional)}"
+kv "python3"        "${PY3_BIN:-NOT INSTALLED (optional)}"
+kv "Xcode CLT"      "${XCLT:-NOT INSTALLED}"
+
+fact brew_prefix "$BREW_PREFIX";  fact brew_version "$BREW_VER"
+fact wg_path "$WG_BIN";           fact wg_version "$WG_VER"
+fact wg_quick_path "$WGQ_BIN"
+fact wireguard_go_path "$WGGO_BIN"; fact wireguard_go_version "$WGGO_VER"
+fact qrencode_path "$QR_BIN";     fact python3_path "$PY3_BIN"
+
+if [ -z "$BREW_BIN" ]; then
+  finding WARN NO_BREW \
+    "Homebrew is not installed." \
+    "Homebrew is the zero-cost route to wireguard-tools and wireguard-go on macOS. See https://brew.sh."
+fi
+if [ -z "$WG_BIN" ] || [ -z "$WGGO_BIN" ]; then
+  finding INFO NO_WIREGUARD \
+    "WireGuard userspace tooling is not fully installed (wg=${WG_BIN:-missing}, wireguard-go=${WGGO_BIN:-missing})." \
+    "Expected: 'brew install wireguard-tools wireguard-go'. Nothing has been installed by this diagnostic."
+fi
+
+note "macOS has no in-kernel WireGuard. A server here runs wireguard-go in"
+note "userspace on a utun interface. That is normal and supported, but it is"
+note "why throughput and CPU cost differ from a Linux kernel implementation."
+
+# ==========================================================================
+# 3. NETWORK INTERFACES & ADDRESSING
+# ==========================================================================
+hdr "NETWORK INTERFACES"
+
+# Map device -> service name via networksetup
+SERVICE_ORDER="$(networksetup -listnetworkserviceorder 2>/dev/null)"
+device_service() {  # device_service en0 -> "Wi-Fi"
+  printf '%s' "$SERVICE_ORDER" | awk -v dev="$1" '
+    /^\([0-9*]+\)/ { svc=$0; sub(/^\([0-9*]+\) /,"",svc); next }
+    /Device: / {
+      d=$0; sub(/.*Device: /,"",d); sub(/\).*/,"",d)
+      if (d==dev) { print svc; exit }
+    }'
+}
+
+# Which device is the Wi-Fi port?
+WIFI_DEV="$(networksetup -listallhardwareports 2>/dev/null \
+  | awk '/Hardware Port: Wi-Fi/{getline; sub(/Device: /,""); print $NF; exit}')"
+
+# Default route (IPv4)
+DEF4="$(route -n get default 2>/dev/null)"
+GW4="$(printf '%s' "$DEF4"  | awk -F': *' '/gateway:/{print $2; exit}')"
+PRIMARY_IF="$(printf '%s' "$DEF4" | awk -F': *' '/interface:/{print $2; exit}')"
+
+# Default route (IPv6)
+DEF6="$(route -n get -inet6 default 2>/dev/null)"
+GW6="$(printf '%s' "$DEF6"  | awk -F': *' '/gateway:/{print $2; exit}')"
+PRIMARY_IF6="$(printf '%s' "$DEF6" | awk -F': *' '/interface:/{print $2; exit}')"
+
+PRIMARY_SVC=""; [ -n "$PRIMARY_IF" ] && PRIMARY_SVC="$(device_service "$PRIMARY_IF")"
+
+LINK_TYPE="unknown"
+if [ -n "$PRIMARY_IF" ]; then
+  if [ "$PRIMARY_IF" = "$WIFI_DEV" ]; then LINK_TYPE="wifi"
+  elif [[ "$PRIMARY_IF" == en* ]];      then LINK_TYPE="ethernet"
+  elif [[ "$PRIMARY_IF" == bridge* ]];  then LINK_TYPE="bridge"
+  elif [[ "$PRIMARY_IF" == utun* ]];    then LINK_TYPE="tunnel"
+  fi
+fi
+
+LAN_IP4=""; LAN_PREFIX=""; LAN_CIDR=""
+if [ -n "$PRIMARY_IF" ]; then
+  LAN_IP4="$(ipconfig getifaddr "$PRIMARY_IF" 2>/dev/null)"
+  MASKHEX="$(ifconfig "$PRIMARY_IF" 2>/dev/null | awk '/inet /{print $4; exit}')"
+  [ -n "$MASKHEX" ] && LAN_PREFIX="$(hexmask_to_prefix "$MASKHEX")"
+  if [ -n "$LAN_IP4" ] && [ -n "$LAN_PREFIX" ]; then
+    LAN_NET_INT=$(( $(ip4_to_int "$LAN_IP4") & (0xFFFFFFFF << (32 - LAN_PREFIX) & 0xFFFFFFFF) ))
+    LAN_CIDR="$(( (LAN_NET_INT>>24)&255 )).$(( (LAN_NET_INT>>16)&255 )).$(( (LAN_NET_INT>>8)&255 )).$(( LAN_NET_INT&255 ))/$LAN_PREFIX"
+  fi
+fi
+
+kv "Primary interface"  "${PRIMARY_IF:-NONE}${PRIMARY_SVC:+  (service: $PRIMARY_SVC)}"
+kv "Link type"          "$LINK_TYPE"
+kv "LAN IPv4"           "${LAN_IP4:-NONE}${LAN_PREFIX:+/$LAN_PREFIX}"
+kv "LAN subnet"         "${LAN_CIDR:-UNKNOWN}"
+kv "Default gateway v4" "${GW4:-NONE}"
+kv "Default gateway v6" "${GW6:-NONE}${PRIMARY_IF6:+  via $PRIMARY_IF6}"
+
+fact primary_interface "$PRIMARY_IF";   fact primary_service "$PRIMARY_SVC"
+fact link_type "$LINK_TYPE";            fact wifi_device "$WIFI_DEV"
+fact lan_ipv4 "$LAN_IP4";               fact lan_prefix "$LAN_PREFIX"
+fact lan_cidr "$LAN_CIDR"
+fact gateway_v4 "$GW4";                 fact gateway_v6 "$GW6"
+
+if [ -z "$PRIMARY_IF" ]; then
+  finding BLOCK NO_DEFAULT_ROUTE \
+    "No IPv4 default route. This machine has no usable Internet path right now." \
+    "Connect to the home network and re-run. Every downstream check is meaningless without this."
+fi
+
+if [ "$LINK_TYPE" = "wifi" ]; then
+  finding WARN SERVER_ON_WIFI \
+    "The server's uplink is Wi-Fi ($PRIMARY_IF)." \
+    "Wi-Fi adds latency variance and drops on roaming/sleep. Ethernet via a USB-C adapter is the single biggest reliability win, and is free if you already own one."
+fi
+
+# --- All interfaces with addresses -----------------------------------------
+say ""
+note "Interfaces carrying addresses:"
+ALL_IFS="$(ifconfig -l 2>/dev/null)"
+EXISTING_UTUNS=""
+EXISTING_V4_NETS=""
+for IFACE in $ALL_IFS; do
+  IFOUT="$(ifconfig "$IFACE" 2>/dev/null)"
+  printf '%s' "$IFOUT" | grep -q 'inet\b\|inet6' || continue
+  STATUS="$(printf '%s' "$IFOUT" | awk -F': *' '/status:/{print $2; exit}')"
+  SVC="$(device_service "$IFACE")"
+
+  # IPv4 addresses on this interface
+  while read -r A M; do
+    [ -n "$A" ] || continue
+    [ "$A" = "127.0.0.1" ] && continue
+    P="$(hexmask_to_prefix "$M")"
+    NI=$(( $(ip4_to_int "$A") & (0xFFFFFFFF << (32 - P) & 0xFFFFFFFF) ))
+    NET="$(( (NI>>24)&255 )).$(( (NI>>16)&255 )).$(( (NI>>8)&255 )).$(( NI&255 ))/$P"
+    EXISTING_V4_NETS="$EXISTING_V4_NETS $NET"
+    [ "$OPT_JSON" -eq 1 ] || printf '    %-10s %-20s %s\n' "$IFACE" "$A/$P" "${SVC:+[$SVC] }${STATUS:+($STATUS)}"
+  done < <(printf '%s' "$IFOUT" | awk '/inet /{print $2, $4}')
+
+  # IPv6 addresses
+  while read -r A6; do
+    [ -n "$A6" ] || continue
+    A6="${A6%%\%*}"
+    [ "$A6" = "::1" ] && continue
+    CLS="$(v6_class "$A6")"
+    [ "$OPT_JSON" -eq 1 ] || printf '    %-10s %-40s %s\n' "$IFACE" "$A6" "[$CLS]"
+  done < <(printf '%s' "$IFOUT" | awk '/inet6 /{print $2}')
+
+  case "$IFACE" in
+    utun*)    EXISTING_UTUNS="$EXISTING_UTUNS $IFACE" ;;
+    bridge1*) finding INFO SHARING_BRIDGE \
+                "Interface $IFACE exists, which usually means macOS Internet Sharing is or was enabled." \
+                "Internet Sharing installs its own NAT and bootpd. It can conflict with the pf NAT this project will use. Review before proceeding." ;;
+  esac
+done
+
+fact existing_utun_interfaces "$(printf '%s' "${EXISTING_UTUNS# }")"
+fact existing_v4_networks "$(printf '%s' "${EXISTING_V4_NETS# }")"
+
+if [ -n "$EXISTING_UTUNS" ]; then
+  note ""
+  note "Existing utun interfaces:${EXISTING_UTUNS}"
+  note "Some are normal (Back to My Mac / iCloud Private Relay / Handoff)."
+  note "Others mean another VPN is active and may fight over routes."
+fi
+
+# ==========================================================================
+# 4. ROUTING TABLE
+# ==========================================================================
+hdr "ROUTING"
+
+RT4="$(netstat -rn -f inet 2>/dev/null)"
+RT6="$(netstat -rn -f inet6 2>/dev/null)"
+RT4_COUNT="$(printf '%s\n' "$RT4" | grep -c '^[0-9]')"
+RT6_COUNT="$(printf '%s\n' "$RT6" | grep -c '^[0-9a-f]')"
+
+kv "IPv4 routes"  "$RT4_COUNT"
+kv "IPv6 routes"  "$RT6_COUNT"
+
+DEFAULT4_COUNT="$(printf '%s\n' "$RT4" | awk '$1=="default"' | wc -l | tr -d ' ')"
+DEFAULT6_COUNT="$(printf '%s\n' "$RT6" | awk '$1=="default"' | wc -l | tr -d ' ')"
+kv "Default IPv4 routes" "$DEFAULT4_COUNT"
+kv "Default IPv6 routes" "$DEFAULT6_COUNT"
+
+fact route_count_v4 "$RT4_COUNT";   fact route_count_v6 "$RT6_COUNT"
+fact default_routes_v4 "$DEFAULT4_COUNT"; fact default_routes_v6 "$DEFAULT6_COUNT"
+
+if [ "${DEFAULT4_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+  finding WARN MULTIPLE_DEFAULT_ROUTES \
+    "$DEFAULT4_COUNT IPv4 default routes are present." \
+    "Another VPN or virtual interface is competing for default egress. Resolve this before adding a full-tunnel server, or routing behaviour will be ambiguous."
+fi
+
+# ==========================================================================
+# 5. DNS
+# ==========================================================================
+hdr "DNS"
+
+SCUTIL_DNS="$(scutil --dns 2>/dev/null)"
+# Resolver #1 is the one used for general queries.
+PRIMARY_NS="$(printf '%s\n' "$SCUTIL_DNS" \
+  | awk '/^resolver #1$/{f=1;next} /^resolver #[2-9]/{f=0} f && /nameserver\[/{print $3}' \
+  | tr '\n' ' ' | sed 's/ *$//')"
+
+SVC_DNS=""
+if [ -n "$PRIMARY_SVC" ]; then
+  SVC_DNS="$(networksetup -getdnsservers "$PRIMARY_SVC" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+fi
+
+SEARCH_DOMAINS="$(printf '%s\n' "$SCUTIL_DNS" \
+  | awk '/^resolver #1$/{f=1;next} /^resolver #[2-9]/{f=0} f && /search domain\[/{print $4}' \
+  | tr '\n' ' ' | sed 's/ *$//')"
+
+kv "Active resolvers"    "${PRIMARY_NS:-NONE}"
+kv "Service DNS setting" "${SVC_DNS:-<empty — DHCP supplied>}"
+kv "Search domains"      "${SEARCH_DOMAINS:-none}"
+
+DNS_IS_GATEWAY=0
+for NS in $PRIMARY_NS; do
+  [ "$NS" = "$GW4" ] && DNS_IS_GATEWAY=1
+done
+kv "Resolver is router"  "$([ $DNS_IS_GATEWAY -eq 1 ] && echo YES || echo NO)"
+
+fact dns_resolvers "$PRIMARY_NS"
+fact dns_service_setting "$SVC_DNS"
+fact dns_search_domains "$SEARCH_DOMAINS"
+fact dns_is_gateway "$DNS_IS_GATEWAY"
+
+# Resolution test
+DNS_RESOLVE_OK=0; DNS_RESOLVE_RESULT=""
+if [ "$OPT_OFFLINE" -eq 0 ]; then
+  if have dig; then
+    DNS_RESOLVE_RESULT="$(dig +short +time=3 +tries=1 "$DNS_TEST_NAME" A 2>/dev/null | head -1)"
+  elif have host; then
+    DNS_RESOLVE_RESULT="$(host -W 3 "$DNS_TEST_NAME" 2>/dev/null | awk '/has address/{print $NF; exit}')"
+  fi
+  [ -n "$DNS_RESOLVE_RESULT" ] && DNS_RESOLVE_OK=1
+  kv "Resolution test"  "$([ $DNS_RESOLVE_OK -eq 1 ] && echo "OK  ($DNS_TEST_NAME -> $DNS_RESOLVE_RESULT)" || echo "FAILED for $DNS_TEST_NAME")"
+else
+  kv "Resolution test"  "SKIPPED (offline)"
+fi
+fact dns_resolves "$DNS_RESOLVE_OK"
+
+# Per-resolver reachability, so we know which ones a VPN client could be pointed at
+if [ "$OPT_OFFLINE" -eq 0 ] && have dig && [ -n "$PRIMARY_NS" ]; then
+  say ""
+  note "Per-resolver check (can a VPN client be pointed at these?):"
+  for NS in $PRIMARY_NS; do
+    R="$(dig +short +time=2 +tries=1 "@$NS" "$DNS_TEST_NAME" A 2>/dev/null | head -1)"
+    [ "$OPT_JSON" -eq 1 ] || printf '    %-40s %s\n' "$NS" "$([ -n "$R" ] && echo "responds" || echo "NO RESPONSE")"
+  done
+fi
+
+if [ "$DNS_IS_GATEWAY" -eq 1 ]; then
+  note ""
+  note "Your resolver is the router itself. That is fine and is the default"
+  note "choice for this project: VPN clients get pointed at the Mac's tunnel"
+  note "address, and the Mac forwards to the router. It keeps DNS inside your"
+  note "home and requires no third party. It also means DNS stops working for"
+  note "clients whenever the Mac or the router is down."
+fi
+
+# ==========================================================================
+# 6. CONNECTIVITY
+# ==========================================================================
+hdr "CONNECTIVITY"
+
+ping4() { ping -c 2 -W 2000 -t 5 -q "$1" >/dev/null 2>&1; }
+ping6t() {
+  if have ping6; then ping6 -c 2 -i 1 "$1" >/dev/null 2>&1
+  else ping -6 -c 2 "$1" >/dev/null 2>&1; fi
+}
+
+GW_REACHABLE=0; NET4_OK=0; NET6_OK=0; HTTPS_OK=0
+
+if [ "$OPT_OFFLINE" -eq 0 ]; then
+  [ -n "$GW4" ] && { ping4 "$GW4" && GW_REACHABLE=1; }
+  ping4 "$PING4_TARGET" && NET4_OK=1
+  ping6t "$PING6_TARGET" && NET6_OK=1
+  if have curl; then
+    curl -4 -s -o /dev/null --max-time 6 "$IPV4_ECHO_URL" && HTTPS_OK=1
+  fi
+  kv "Gateway reachable"  "$([ $GW_REACHABLE -eq 1 ] && echo YES || echo "NO (${GW4:-no gateway})")"
+  kv "IPv4 Internet"      "$([ $NET4_OK  -eq 1 ] && echo "AVAILABLE (icmp $PING4_TARGET)" || echo "UNAVAILABLE")"
+  kv "IPv6 Internet"      "$([ $NET6_OK  -eq 1 ] && echo "AVAILABLE (icmp $PING6_TARGET)" || echo "UNAVAILABLE")"
+  kv "HTTPS egress"       "$([ $HTTPS_OK -eq 1 ] && echo OK || echo FAILED)"
+else
+  kv "All probes"         "SKIPPED (offline)"
+fi
+
+fact gateway_reachable "$GW_REACHABLE"
+fact ipv4_internet "$NET4_OK"
+fact ipv6_internet "$NET6_OK"
+fact https_egress "$HTTPS_OK"
+
+if [ "$OPT_OFFLINE" -eq 0 ] && [ "$NET4_OK" -eq 0 ] && [ "$HTTPS_OK" -eq 0 ]; then
+  finding BLOCK NO_INTERNET \
+    "No IPv4 Internet connectivity could be confirmed (ICMP and HTTPS both failed)." \
+    "Reachability analysis below is unreliable. Fix connectivity and re-run."
+fi
+
+# ==========================================================================
+# 7. PUBLIC ADDRESSING, NAT DEPTH, CGNAT
+# ==========================================================================
+hdr "PUBLIC ADDRESSING / NAT"
+
+PUB4=""; PUB6=""; ROUTER_WAN=""
+if [ "$OPT_OFFLINE" -eq 0 ] && have curl; then
+  PUB4="$(curl -4 -s --max-time 6 "$IPV4_ECHO_URL" 2>/dev/null | tr -d '[:space:]')"
+  PUB6="$(curl -6 -s --max-time 6 "$IPV6_ECHO_URL" 2>/dev/null | tr -d '[:space:]')"
+  # Sanity-check: the echo service must return something address-shaped.
+  printf '%s' "$PUB4" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || PUB4=""
+  printf '%s' "$PUB6" | grep -q ':' || PUB6=""
+fi
+
+kv "Public IPv4 (observed)" "${PUB4:-UNKNOWN}"
+kv "Public IPv6 (observed)" "${PUB6:-NONE}"
+
+# --- Router's own view of its WAN address (UPnP, best effort) ---------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UPNP_STATUS="not attempted"
+if [ "$OPT_OFFLINE" -eq 0 ] && [ -n "$PY3_BIN" ] && [ -f "$SCRIPT_DIR/upnp-wan-ip.py" ]; then
+  ROUTER_WAN="$("$PY3_BIN" "$SCRIPT_DIR/upnp-wan-ip.py" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$ROUTER_WAN" ]; then UPNP_STATUS="answered"
+  else UPNP_STATUS="no answer (UPnP off, or router does not expose IGD)"; fi
+elif [ -z "$PY3_BIN" ]; then
+  UPNP_STATUS="skipped (python3 not available)"
+elif [ "$OPT_OFFLINE" -eq 1 ]; then
+  UPNP_STATUS="skipped (offline)"
+fi
+kv "Router WAN (via UPnP)" "${ROUTER_WAN:-$UPNP_STATUS}"
+
+# --- Traceroute hop analysis ------------------------------------------------
+TRACE_HOPS=""; PRIVATE_HOP_COUNT=0; CGNAT_HOP=""
+if [ "$OPT_OFFLINE" -eq 0 ] && [ "$OPT_FAST" -eq 0 ] && have traceroute; then
+  TRACE_RAW="$(traceroute -n -m 8 -w 2 -q 1 "$TRACE_TARGET" 2>/dev/null)"
+  TRACE_HOPS="$(printf '%s\n' "$TRACE_RAW" \
+    | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $2}' \
+    | tr '\n' ' ' | sed 's/ *$//')"
+  HOPN=0
+  for H in $TRACE_HOPS; do
+    HOPN=$(( HOPN + 1 ))
+    if is_cgnat "$H"; then
+      CGNAT_HOP="$H"
+      PRIVATE_HOP_COUNT=$(( PRIVATE_HOP_COUNT + 1 ))
+    elif is_rfc1918 "$H"; then
+      PRIVATE_HOP_COUNT=$(( PRIVATE_HOP_COUNT + 1 ))
+    else
+      break   # first globally routable hop ends the private prefix
+    fi
+  done
+  kv "Traceroute hops"       "${TRACE_HOPS:-none returned}"
+  kv "Private hops at edge"  "$PRIVATE_HOP_COUNT"
+elif [ "$OPT_FAST" -eq 1 ]; then
+  kv "Traceroute"            "SKIPPED (--fast)"
+fi
+
+fact public_ipv4 "$PUB4";        fact public_ipv6 "$PUB6"
+fact router_wan_ipv4 "$ROUTER_WAN"
+fact upnp_status "$UPNP_STATUS"
+fact traceroute_hops "$TRACE_HOPS"
+fact private_edge_hops "$PRIVATE_HOP_COUNT"
+
+# --------------------------------------------------------------------------
+# CGNAT determination
+#   Values: none | likely | confirmed | unknown
+#   We only say "confirmed" when two independent signals agree, or when a
+#   single signal is definitionally conclusive.
+# --------------------------------------------------------------------------
+classify_cgnat "$PUB4" "$LAN_IP4" "$ROUTER_WAN" "$CGNAT_HOP" "$PRIVATE_HOP_COUNT" "$TRACE_HOPS"
+
+say ""
+kv "NAT layers (est.)" "$NAT_LAYERS"
+case "$CGNAT_STATE" in
+  confirmed) kv "CGNAT" "${C_RED}CONFIRMED${C_RST}" ;;
+  likely)    kv "CGNAT" "${C_YEL}LIKELY${C_RST}" ;;
+  none)      kv "CGNAT" "${C_GRN}NOT DETECTED${C_RST}" ;;
+  *)         kv "CGNAT" "UNKNOWN (insufficient evidence)" ;;
+esac
+[ -n "$CGNAT_EVIDENCE" ] && note "Evidence: $CGNAT_EVIDENCE"
+
+fact cgnat_state "$CGNAT_STATE"
+fact cgnat_evidence "$CGNAT_EVIDENCE"
+fact nat_layers "$NAT_LAYERS"
+
+if [ "$CGNAT_STATE" = "confirmed" ]; then
+  finding BLOCK CGNAT_CONFIRMED \
+    "Your ISP places you behind carrier-grade NAT." \
+    "Port forwarding on your own router CANNOT fix this. The forward would only expose you on your router's private WAN address, which the Internet cannot reach. Inbound IPv4 requires either a public IPv4 address from your ISP, a working public IPv6 path, or an external rendezvous host — see docs/limitations.md."
+elif [ "$CGNAT_STATE" = "likely" ]; then
+  finding WARN CGNAT_LIKELY \
+    "Evidence suggests carrier-grade NAT or double NAT, but it is not conclusive." \
+    "Enable UPnP on the router temporarily and re-run, or read the router's WAN status page and compare it against $PUB4."
+fi
+
+# ==========================================================================
+# 8. IPv6 ASSESSMENT
+# ==========================================================================
+hdr "IPv6"
+
+V6_GUA=""; V6_ULA=""; V6_PREFIX=""
+if [ -n "$PRIMARY_IF" ]; then
+  while read -r A6; do
+    A6="${A6%%\%*}"
+    case "$(v6_class "$A6")" in
+      global) [ -z "$V6_GUA" ] && V6_GUA="$A6" ;;
+      ula)    [ -z "$V6_ULA" ] && V6_ULA="$A6" ;;
+    esac
+  done < <(ifconfig "$PRIMARY_IF" 2>/dev/null | awk '/inet6 /{print $2}')
+fi
+[ -n "$V6_GUA" ] && V6_PREFIX="$(printf '%s' "$V6_GUA" | awk -F: '{printf "%s:%s:%s:%s::/64", $1,$2,$3,$4}')"
+
+V6_END_TO_END=0
+if [ -n "$V6_GUA" ] && [ -n "$PUB6" ] && [ "$V6_GUA" = "$PUB6" ]; then
+  V6_END_TO_END=1
+fi
+
+kv "Global address (GUA)"  "${V6_GUA:-NONE}"
+kv "ULA address"           "${V6_ULA:-none}"
+kv "Delegated /64"         "${V6_PREFIX:-N/A}"
+kv "Default v6 route"      "${GW6:-NONE}"
+kv "v6 Internet reachable" "$([ "$NET6_OK" -eq 1 ] && echo YES || echo NO)"
+kv "End-to-end (no NAT66)" "$([ "$V6_END_TO_END" -eq 1 ] && echo "YES — this Mac's own address is what the Internet sees" || echo "NO / unproven")"
+
+fact ipv6_gua "$V6_GUA";        fact ipv6_ula "$V6_ULA"
+fact ipv6_prefix "$V6_PREFIX";  fact ipv6_end_to_end "$V6_END_TO_END"
+
+# Verdict for IPv6 usability as a VPN transport
+V6_TRANSPORT="unusable"
+if [ -n "$V6_GUA" ] && [ -n "$GW6" ] && [ "$NET6_OK" -eq 1 ] && [ "$V6_END_TO_END" -eq 1 ]; then
+  V6_TRANSPORT="candidate"
+elif [ -n "$V6_GUA" ] && [ "$NET6_OK" -eq 1 ]; then
+  V6_TRANSPORT="partial"
+fi
+fact ipv6_transport "$V6_TRANSPORT"
+
+say ""
+case "$V6_TRANSPORT" in
+  candidate)
+    kv "As a VPN transport" "${C_GRN}CANDIDATE${C_RST}"
+    note "This Mac has a globally routable IPv6 address and the Internet sees"
+    note "that same address. If your router's IPv6 firewall can be told to allow"
+    note "inbound UDP to this address on the WireGuard port, clients on IPv6-capable"
+    note "networks can reach it directly, CGNAT on IPv4 notwithstanding."
+    note ""
+    note "Two caveats this diagnostic cannot resolve on its own:"
+    note "  1. The prefix is very likely dynamic. Re-run over several days to see."
+    note "  2. Client-side IPv6 is not guaranteed. Some mobile carriers and most"
+    note "     hotel/cafe networks are IPv4-only, and those clients cannot use an"
+    note "     IPv6-only endpoint at all."
+    finding INFO IPV6_CANDIDATE \
+      "IPv6 looks viable as an inbound transport." \
+      "Confirm the router allows inbound UDP to $V6_GUA, and track prefix stability across reboots."
+    ;;
+  partial)
+    kv "As a VPN transport" "${C_YEL}PARTIAL${C_RST}"
+    note "IPv6 works for outbound traffic but end-to-end reachability is not proven."
+    finding WARN IPV6_PARTIAL \
+      "IPv6 is present but its inbound usability is unproven." \
+      "Do not advertise ::/0 to clients until routing and inbound reachability are verified."
+    ;;
+  *)
+    kv "As a VPN transport" "${C_RED}UNUSABLE${C_RST}"
+    note "No usable IPv6. The tunnel must be IPv4-only, and client configs must"
+    note "actively prevent IPv6 leakage rather than ignoring IPv6."
+    finding INFO IPV6_ABSENT \
+      "No usable IPv6 path." \
+      "Client configs must not advertise ::/0. Plan explicit IPv6 leak prevention on clients."
+    ;;
+esac
+
+# ==========================================================================
+# 9. FIREWALL & FORWARDING
+# ==========================================================================
+hdr "FIREWALL & FORWARDING"
+
+ALF="/usr/libexec/ApplicationFirewall/socketfilterfw"
+ALF_STATE="unknown"; ALF_STEALTH="unknown"; ALF_BLOCKALL="unknown"
+if [ -x "$ALF" ]; then
+  ALF_STATE="$("$ALF" --getglobalstate 2>/dev/null | sed 's/.*(State = \([0-9]*\)).*/\1/')"
+  ALF_STEALTH="$("$ALF" --getstealthmode 2>/dev/null | grep -qi 'enabled' && echo on || echo off)"
+  ALF_BLOCKALL="$("$ALF" --getblockall 2>/dev/null | grep -qi 'enabled' && echo on || echo off)"
+  case "$ALF_STATE" in 1|2) ALF_STATE="enabled" ;; 0) ALF_STATE="disabled" ;; esac
+fi
+
+IPFWD4="$(sysctl -n net.inet.ip.forwarding 2>/dev/null)"
+IPFWD6="$(sysctl -n net.inet6.ip6.forwarding 2>/dev/null)"
+
+kv "Application Firewall"  "$ALF_STATE"
+kv "  stealth mode"        "$ALF_STEALTH"
+kv "  block all incoming"  "$ALF_BLOCKALL"
+kv "IPv4 forwarding"       "$([ "$IPFWD4" = "1" ] && echo "ON" || echo "OFF (default)")"
+kv "IPv6 forwarding"       "$([ "$IPFWD6" = "1" ] && echo "ON" || echo "OFF (default)")"
+
+fact alf_state "$ALF_STATE";      fact alf_stealth "$ALF_STEALTH"
+fact alf_block_all "$ALF_BLOCKALL"
+fact ip_forwarding_v4 "${IPFWD4:-0}"; fact ip_forwarding_v6 "${IPFWD6:-0}"
+
+if [ "$ALF_BLOCKALL" = "on" ]; then
+  finding WARN ALF_BLOCK_ALL \
+    "The Application Firewall is set to block all incoming connections." \
+    "This will block inbound WireGuard UDP. It must be relaxed for the wireguard-go binary specifically, not disabled wholesale."
+fi
+
+# --- pf ---------------------------------------------------------------------
+PF_STATUS="not inspected"; PF_RULE_COUNT=""; PF_NAT_COUNT=""; PF_ANCHORS=""
+PFCONF_EXISTS="no"; [ -f /etc/pf.conf ] && PFCONF_EXISTS="yes"
+
+if [ "$OPT_SUDO" -eq 1 ]; then
+  say ""
+  note "Inspecting pf requires root. These are read-only queries:"
+  note "  pfctl -s info | pfctl -s rules | pfctl -s nat | pfctl -s Anchors"
+  PF_INFO="$(sudo pfctl -s info 2>/dev/null)"
+  if [ -n "$PF_INFO" ]; then
+    PF_STATUS="$(printf '%s\n' "$PF_INFO" | awk -F': *' '/^Status:/{print $2; exit}' | awk '{print $1}')"
+    PF_RULE_COUNT="$(sudo pfctl -s rules 2>/dev/null | grep -c . )"
+    PF_NAT_COUNT="$(sudo pfctl -s nat 2>/dev/null | grep -c . )"
+    PF_ANCHORS="$(sudo pfctl -s Anchors 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+  else
+    PF_STATUS="query failed (no sudo, or pf unavailable)"
+  fi
+else
+  PF_STATUS="not inspected (re-run with --with-sudo)"
+fi
+
+kv "pf status"        "$PF_STATUS"
+kv "pf rules"         "${PF_RULE_COUNT:-?}"
+kv "pf nat rules"     "${PF_NAT_COUNT:-?}"
+kv "pf anchors"       "${PF_ANCHORS:-?}"
+kv "/etc/pf.conf"     "$PFCONF_EXISTS"
+
+fact pf_status "$PF_STATUS";        fact pf_rule_count "$PF_RULE_COUNT"
+fact pf_nat_count "$PF_NAT_COUNT";  fact pf_anchors "$PF_ANCHORS"
+fact pf_conf_exists "$PFCONF_EXISTS"
+
+if [ -n "$PF_NAT_COUNT" ] && [ "$PF_NAT_COUNT" -gt 0 ] 2>/dev/null; then
+  finding WARN PF_EXISTING_NAT \
+    "pf already carries $PF_NAT_COUNT NAT rule(s)." \
+    "Something else (Internet Sharing, Docker, another VPN) owns NAT on this machine. This project must add rules in its own anchor and must not flush the existing ruleset."
+fi
+
+note ""
+note "Design note: this project will never write to /etc/pf.conf directly."
+note "macOS updates overwrite that file. Rules belong in a dedicated anchor"
+note "loaded from our own file, so uninstall is a clean unload rather than a"
+note "guess about which lines were ours."
+
+# ==========================================================================
+# 10. POWER / AVAILABILITY
+# ==========================================================================
+hdr "POWER & AVAILABILITY"
+
+PM_CUSTOM="$(pmset -g custom 2>/dev/null)"
+PM_BATT="$(pmset -g batt 2>/dev/null | head -2)"
+POWER_SOURCE="$(printf '%s' "$PM_BATT" | awk -F"'" '/Now drawing/{print $2}')"
+
+pm_get() {  # pm_get <block: AC|Battery> <key>
+  printf '%s\n' "$PM_CUSTOM" | awk -v blk="$1" -v key="$2" '
+    /^AC Power:/    { inblk = (blk=="AC") }
+    /^Battery Power:/{ inblk = (blk=="Battery") }
+    inblk && $1==key { print $2; exit }'
+}
+
+AC_SLEEP="$(pm_get AC sleep)"
+AC_DISKSLEEP="$(pm_get AC disksleep)"
+AC_POWERNAP="$(pm_get AC powernap)"
+AC_WOMP="$(pm_get AC womp)"
+BAT_SLEEP="$(pm_get Battery sleep)"
+DISABLESLEEP="$(printf '%s\n' "$PM_CUSTOM" | awk '$1=="disablesleep"{print $2; exit}')"
+ASSERTIONS="$(pmset -g assertions 2>/dev/null | awk '/PreventUserIdleSystemSleep/{print $NF; exit}')"
+
+kv "Power source"          "${POWER_SOURCE:-unknown}"
+kv "Sleep on AC (min)"     "${AC_SLEEP:-?}  $([ "${AC_SLEEP:-1}" = "0" ] && echo '(never — good for a server)' || echo '(will sleep — VPN goes down)')"
+kv "Sleep on battery (min)" "${BAT_SLEEP:-?}"
+kv "Disk sleep on AC"      "${AC_DISKSLEEP:-?}"
+kv "Power Nap on AC"       "${AC_POWERNAP:-?}"
+kv "Wake on network (womp)" "${AC_WOMP:-?}"
+kv "disablesleep"          "${DISABLESLEEP:-0}  $([ "${DISABLESLEEP:-0}" = "1" ] && echo '(lid-close sleep suppressed)')"
+kv "Sleep prevented now"   "${ASSERTIONS:-0}"
+
+fact power_source "$POWER_SOURCE"
+fact ac_sleep "$AC_SLEEP";          fact battery_sleep "$BAT_SLEEP"
+fact ac_powernap "$AC_POWERNAP";    fact wake_on_network "$AC_WOMP"
+fact disablesleep "${DISABLESLEEP:-0}"
+
+if [ "${AC_SLEEP:-1}" != "0" ]; then
+  finding WARN WILL_SLEEP \
+    "On AC power this Mac sleeps after ${AC_SLEEP:-?} minutes of idle." \
+    "A sleeping Mac is an offline VPN. Changing this is a real trade-off (heat, battery wear, energy) and this project will explain it before touching pmset — it will not change it silently."
+fi
+if [ "${DISABLESLEEP:-0}" != "1" ]; then
+  note ""
+  note "Lid closed with no external display attached still sleeps the machine,"
+  note "regardless of the idle sleep timer. That is a separate setting."
+fi
+
+note ""
+note "Honest framing: a MacBook Air is not a server. The realistic zero-cost"
+note "posture is: on AC, lid open or clamshell with an external display, idle"
+note "sleep disabled, and an accepted risk that the tunnel drops whenever the"
+note "machine is carried away. Section 22 of the plan covers this in full."
+
+# ==========================================================================
+# 11. VPN SUBNET SELECTION
+# ==========================================================================
+hdr "VPN SUBNET SELECTION"
+
+# Ranges we must not collide with: everything currently on this machine, plus
+# the private ranges most likely to appear on a network a client roams onto.
+OCCUPIED="$EXISTING_V4_NETS"
+COMMON_CLIENT_NETS="192.168.0.0/24 192.168.1.0/24 192.168.2.0/24 192.168.86.0/24 192.168.100.0/24 172.17.0.0/16 10.0.0.0/24 10.0.1.0/24"
+
+CANDIDATES="10.77.0.0/24 10.83.0.0/24 10.91.0.0/24 10.137.0.0/24 172.29.13.0/24 10.213.7.0/24"
+CHOSEN=""
+for CAND in $CANDIDATES; do
+  CONFLICT=""
+  for OCC in $OCCUPIED $COMMON_CLIENT_NETS; do
+    [ -n "$OCC" ] || continue
+    if cidr_overlap "$CAND" "$OCC"; then CONFLICT="$OCC"; break; fi
+  done
+  if [ -z "$CONFLICT" ]; then
+    [ -z "$CHOSEN" ] && CHOSEN="$CAND"
+    [ "$OPT_JSON" -eq 1 ] || printf '    %-18s %sfree%s\n' "$CAND" "$C_GRN" "$C_RST"
+  else
+    [ "$OPT_JSON" -eq 1 ] || printf '    %-18s %sconflicts with %s%s\n' "$CAND" "$C_YEL" "$CONFLICT" "$C_RST"
+  fi
+done
+
+# Suggest a ULA /64 for the tunnel's IPv6 side. Random per RFC 4193.
+ULA_SUGGEST=""
+if [ -r /dev/urandom ]; then
+  ULA_HEX="$(head -c 5 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  ULA_SUGGEST="fd${ULA_HEX:0:2}:${ULA_HEX:2:4}:${ULA_HEX:6:4}::/64"
+fi
+
+say ""
+kv "Recommended VPN subnet" "${CHOSEN:-NONE FREE — choose manually}"
+kv "Suggested ULA (v6 side)" "${ULA_SUGGEST:-n/a}"
+note "The ULA is regenerated on every run. Whatever the installer picks gets"
+note "written to config once and then stays fixed."
+note ""
+note "Chosen to avoid both this machine's current networks and the private"
+note "ranges a roaming client is most likely to sit on. A full-tunnel client on"
+note "a cafe network using the same range as your VPN would break routing."
+
+fact vpn_subnet_recommended "$CHOSEN"
+fact vpn_ula_suggested "$ULA_SUGGEST"
+fact subnet_candidates "$CANDIDATES"
+
+if [ -z "$CHOSEN" ]; then
+  finding WARN NO_FREE_SUBNET \
+    "Every candidate VPN subnet conflicts with an existing network." \
+    "Pick a subnet manually from a range you know is unused, and pass it to the installer."
+fi
+
+# ==========================================================================
+# 12. VERDICT
+# ==========================================================================
+hdr "VERDICT"
+
+VERDICT="YELLOW"
+VERDICT_REASON=""
+
+if [ "$OPT_OFFLINE" -eq 1 ]; then
+  VERDICT="UNKNOWN"
+  VERDICT_REASON="Offline mode: reachability was never tested, so no classification is possible."
+elif [ "$NET4_OK" -eq 0 ] && [ "$HTTPS_OK" -eq 0 ]; then
+  VERDICT="RED"
+  VERDICT_REASON="No Internet connectivity from this machine. Nothing downstream can be assessed."
+elif [ "$CGNAT_STATE" = "confirmed" ] && [ "$V6_TRANSPORT" != "candidate" ]; then
+  VERDICT="RED"
+  VERDICT_REASON="Carrier-grade NAT is confirmed and there is no usable public IPv6. Direct inbound connections to this Mac are not possible from the Internet, and no router setting can change that."
+elif [ "$CGNAT_STATE" = "confirmed" ] && [ "$V6_TRANSPORT" = "candidate" ]; then
+  VERDICT="YELLOW"
+  VERDICT_REASON="IPv4 is behind carrier-grade NAT, but IPv6 looks viable as an inbound transport. This works only for clients that themselves have IPv6."
+elif [ "$CGNAT_STATE" = "likely" ]; then
+  VERDICT="YELLOW"
+  VERDICT_REASON="Carrier-grade NAT or double NAT is suspected but unproven. Resolve this before building anything that depends on inbound IPv4."
+elif [ "$CGNAT_STATE" = "none" ]; then
+  VERDICT="YELLOW"
+  VERDICT_REASON="A routable public IPv4 address was observed with no NAT above your router. Inbound UDP should be achievable with one port-forward rule — but this diagnostic cannot prove inbound reachability from inside your own network. Confirm with a real client on cellular data."
+else
+  VERDICT="YELLOW"
+  VERDICT_REASON="NAT topology could not be determined conclusively."
+fi
+
+case "$VERDICT" in
+  RED)     say ""; say "  ${C_B}${C_RED}RED${C_RST}  — direct inbound connectivity is unavailable" ;;
+  YELLOW)  say ""; say "  ${C_B}${C_YEL}YELLOW${C_RST} — possible, with router configuration or caveats" ;;
+  GREEN)   say ""; say "  ${C_B}${C_GRN}GREEN${C_RST} — directly reachable and suitable" ;;
+  *)       say ""; say "  ${C_B}UNKNOWN${C_RST}" ;;
+esac
+say ""
+say "  $VERDICT_REASON"
+
+fact verdict "$VERDICT"
+fact verdict_reason "$VERDICT_REASON"
+
+note ""
+note "Why never GREEN from inside your own LAN: a host cannot prove that an"
+note "inbound UDP packet from the Internet would reach it by testing from"
+note "within that same network. GREEN is only awarded after a real handshake"
+note "from an outside client. That test belongs to Phase 3."
+
+# ==========================================================================
+# 13. FINDINGS
+# ==========================================================================
+if [ "$FINDINGS_N" -gt 0 ]; then
+  hdr "FINDINGS"
+  for LEVEL in BLOCK WARN INFO; do
+    FI=0
+    while [ "$FI" -lt "$FINDINGS_N" ]; do
+      IFS='|' read -r L CODE MSG ACT <<< "${FINDINGS[$FI]}"
+      FI=$(( FI + 1 ))
+      [ "$L" = "$LEVEL" ] || continue
+      case "$L" in
+        BLOCK) TAG="${C_RED}BLOCK${C_RST}" ;;
+        WARN)  TAG="${C_YEL}WARN ${C_RST}" ;;
+        *)     TAG="${C_CYN}INFO ${C_RST}" ;;
+      esac
+      say ""
+      say "  [$TAG] $CODE"
+      say "    $MSG"
+      [ -n "$ACT" ] && say "    ${C_DIM}-> $ACT${C_RST}"
+    done
+  done
+fi
+
+# ==========================================================================
+# 14. JSON / SAVE
+# ==========================================================================
+
+fact has_blocking "$HAS_CRITICAL"
+fact has_warnings "$HAS_WARN"
+fact findings_total "$FINDINGS_N"
+
+if [ "$OPT_JSON" -eq 1 ]; then
+  emit_json
+fi
+
+if [ "$OPT_SAVE" -eq 1 ]; then
+  OUT_DIR="$SCRIPT_DIR/../reports"
+  mkdir -p "$OUT_DIR" 2>/dev/null
+  OUT_FILE="$OUT_DIR/doctor-$(date '+%Y%m%d-%H%M%S').json"
+  emit_json > "$OUT_FILE"
+  chmod 600 "$OUT_FILE" 2>/dev/null
+  say ""
+  say "  Report written to: $OUT_FILE"
+  say "  ${C_DIM}This file contains your public IP and LAN topology. reports/ is${C_RST}"
+  say "  ${C_DIM}gitignored. Review it before sharing it anywhere.${C_RST}"
+fi
+
+# --------------------------------------------------------------------------
+# Exit status
+#   0  no blocking findings
+#   1  at least one BLOCK finding — the project cannot proceed as designed
+# --------------------------------------------------------------------------
+BLOCK_N=0; WARN_N=0; INFO_N=0
+FI=0
+while [ "$FI" -lt "$FINDINGS_N" ]; do
+  case "${FINDINGS[$FI]%%|*}" in
+    BLOCK) BLOCK_N=$(( BLOCK_N + 1 )) ;;
+    WARN)  WARN_N=$(( WARN_N + 1 )) ;;
+    *)     INFO_N=$(( INFO_N + 1 )) ;;
+  esac
+  FI=$(( FI + 1 ))
+done
+
+say ""
+say "  ${C_B}Summary:${C_RST} $BLOCK_N blocking, $WARN_N warnings, $INFO_N informational"
+
+if [ "$HAS_CRITICAL" -eq 1 ]; then
+  say "  ${C_RED}This environment has at least one blocking problem.${C_RST}"
+  say "  ${C_DIM}Read the BLOCK findings above before proceeding to Phase 2.${C_RST}"
+  say ""
+  exit 1
+fi
+
+if [ "$HAS_WARN" -eq 1 ]; then
+  say "  ${C_YEL}No blocking problems, but there are caveats to decide about.${C_RST}"
+else
+  say "  ${C_GRN}No blocking problems found.${C_RST}"
+fi
+say ""
+exit 0
