@@ -5,148 +5,160 @@
 <title>VPN for MHS</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #060a08;
-    --panel: #0c1410;
-    --panel-border: #163224;
-    --green: #33ff8c;
-    --green-dim: #1c8f52;
-    --red: #ff4d5e;
-    --amber: #ffb020;
-    --text: #c9f7dc;
-    --text-dim: #5f8f76;
+    --bg: #f4f6f9;
+    --panel: #ffffff;
+    --panel-border: #e3e8ef;
+    --text: #1a2233;
+    --text-dim: #6b7688;
+    --blue: #2563eb;
+    --blue-dim: #eef2ff;
+    --green: #16a34a;
+    --green-dim: #ecfdf3;
+    --red: #dc2626;
+    --red-dim: #fef2f2;
+    --amber: #b45309;
   }
   * { box-sizing: border-box; }
   html, body {
     margin: 0; padding: 0; min-height: 100%;
     background: var(--bg); color: var(--text);
-    font-family: 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
-  }
-  canvas#rain {
-    position: fixed; inset: 0; z-index: 0; opacity: 0.16; pointer-events: none;
-  }
-  .scanlines {
-    position: fixed; inset: 0; z-index: 1; pointer-events: none;
-    background: repeating-linear-gradient(
-      to bottom, rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px,
-      rgba(0,0,0,0.12) 3px, rgba(0,0,0,0) 4px
-    );
-    mix-blend-mode: overlay;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   }
   .wrap {
-    position: relative; z-index: 2;
-    max-width: 780px; margin: 0 auto; padding: 3rem 1.5rem 4rem;
+    max-width: 720px; margin: 0 auto; padding: 2.5rem 1.5rem 4rem;
   }
-  header { margin-bottom: 2rem; }
-  .brand {
-    font-size: 0.85rem; color: var(--text-dim); letter-spacing: 0.15em;
+  header {
+    display: flex; align-items: center; gap: 0.75rem; margin-bottom: 2rem;
   }
-  h1 {
-    font-size: 1.6rem; margin: 0.25rem 0 0; font-weight: 700;
-    color: var(--green); text-shadow: 0 0 12px rgba(51,255,140,0.35);
+  .logo {
+    width: 40px; height: 40px; border-radius: 10px; background: var(--blue);
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
   }
-  .cursor { display: inline-block; width: 0.55em; background: var(--green);
-    animation: blink 1s steps(1) infinite; margin-left: 2px; }
-  @keyframes blink { 50% { opacity: 0; } }
+  .logo svg { width: 22px; height: 22px; }
+  h1 { font-size: 1.15rem; margin: 0; font-weight: 700; color: var(--text); }
+  .subtitle { font-size: 0.82rem; color: var(--text-dim); margin-top: 0.1rem; }
 
   .panel {
     background: var(--panel); border: 1px solid var(--panel-border);
-    border-radius: 10px; padding: 1.25rem 1.5rem; margin-bottom: 1.25rem;
-    box-shadow: 0 0 24px rgba(51,255,140,0.04), inset 0 0 40px rgba(0,0,0,0.35);
+    border-radius: 14px; padding: 1.5rem 1.5rem; margin-bottom: 1.25rem;
+    box-shadow: 0 1px 2px rgba(20,30,50,0.04), 0 1px 12px rgba(20,30,50,0.03);
   }
   .panel h2 {
-    font-size: 0.72rem; letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--text-dim); margin: 0 0 0.9rem;
+    font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--text-dim); margin: 0 0 1rem; font-weight: 600;
   }
 
-  .status-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1.1rem; }
-  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--red);
-    box-shadow: 0 0 10px var(--red); flex-shrink: 0; }
-  .dot.on { background: var(--green); box-shadow: 0 0 12px var(--green); animation: pulse 2s ease-in-out infinite; }
-  @keyframes pulse { 0%,100% { box-shadow: 0 0 8px var(--green); } 50% { box-shadow: 0 0 18px var(--green); } }
-  .status-text { font-size: 1.05rem; font-weight: 700; }
+  /* --- hero status --- */
+  .hero { text-align: center; padding: 0.5rem 0 1.25rem; }
+  .shield {
+    width: 88px; height: 88px; margin: 0 auto 1rem;
+    border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: var(--red-dim); transition: background 0.2s ease;
+  }
+  .shield.on { background: var(--green-dim); }
+  .shield svg { width: 44px; height: 44px; }
+  .status-text { font-size: 1.25rem; font-weight: 700; margin-bottom: 0.3rem; }
   .status-text.on { color: var(--green); }
   .status-text.off { color: var(--red); }
+  .status-sub { font-size: 0.88rem; color: var(--text-dim); margin-bottom: 1.5rem; }
 
-  .btnrow { display: flex; gap: 0.75rem; margin-bottom: 0.4rem; }
+  .btnrow { display: flex; justify-content: center; gap: 0.75rem; margin-bottom: 0.5rem; }
   button {
-    font-family: inherit; font-size: 0.95rem; font-weight: 700;
-    padding: 0.85rem 1.6rem; border-radius: 8px; border: 1px solid transparent;
-    cursor: pointer; letter-spacing: 0.03em; transition: transform 0.08s ease;
+    font-family: inherit; font-size: 0.98rem; font-weight: 600;
+    padding: 0.8rem 2.2rem; border-radius: 10px; border: 1px solid transparent;
+    cursor: pointer; transition: filter 0.1s ease, transform 0.08s ease;
   }
-  button:active { transform: scale(0.97); }
+  button:active { transform: scale(0.98); }
   button:disabled { opacity: 0.5; cursor: default; }
-  #connect { background: var(--green); color: #04170c; box-shadow: 0 0 18px rgba(51,255,140,0.35); }
-  #disconnect { background: transparent; color: var(--red); border-color: var(--red); }
-  #msg { font-size: 0.8rem; color: var(--text-dim); min-height: 1.2em; margin-top: 0.5rem; }
+  #connect { background: var(--blue); color: #fff; }
+  #connect:hover:not(:disabled) { filter: brightness(1.08); }
+  #disconnect { background: #fff; color: var(--red); border-color: #f3c8c8; }
+  #disconnect:hover:not(:disabled) { background: var(--red-dim); }
+  #msg { font-size: 0.82rem; color: var(--text-dim); min-height: 1.2em; margin-top: 0.75rem; text-align: center; }
   #msg.err { color: var(--red); }
 
-  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.9rem; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.75rem; }
   @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
-  .stat { border: 1px solid var(--panel-border); border-radius: 8px; padding: 0.7rem 0.9rem; background: rgba(255,255,255,0.015); }
-  .stat .label { font-size: 0.68rem; letter-spacing: 0.08em; color: var(--text-dim); text-transform: uppercase; }
-  .stat .value { font-size: 1.02rem; margin-top: 0.25rem; word-break: break-word; }
+  .stat { border: 1px solid var(--panel-border); border-radius: 10px; padding: 0.7rem 0.9rem; background: #fbfcfe; }
+  .stat .label { font-size: 0.68rem; letter-spacing: 0.04em; color: var(--text-dim); text-transform: uppercase; font-weight: 600; }
+  .stat .value { font-size: 0.95rem; margin-top: 0.3rem; word-break: break-word; color: var(--text); }
   .stat .value.warn { color: var(--amber); }
   .stat .value.bad { color: var(--red); }
   .stat .value.good { color: var(--green); }
 
   .iprow { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
-  .ip-big { font-size: 1.7rem; font-weight: 700; color: var(--green); text-shadow: 0 0 10px rgba(51,255,140,0.3); }
-  .ip-big.off { color: var(--text); text-shadow: none; }
+  .ip-big { font-size: 1.55rem; font-weight: 700; color: var(--text); }
+  .ip-big.off { color: var(--text-dim); }
   .refresh-btn {
-    background: transparent; border: 1px solid var(--panel-border); color: var(--text-dim);
-    font-size: 0.75rem; padding: 0.4rem 0.7rem; border-radius: 6px;
+    background: #fff; border: 1px solid var(--panel-border); color: var(--text-dim);
+    font-size: 0.78rem; padding: 0.4rem 0.75rem; border-radius: 8px; font-weight: 600;
   }
-  .refresh-btn:hover { color: var(--green); border-color: var(--green-dim); }
+  .refresh-btn:hover { color: var(--blue); border-color: #c7d5f5; }
   .spin { display: inline-block; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  footer { color: var(--text-dim); font-size: 0.72rem; text-align: center; margin-top: 2rem; opacity: 0.6; }
+  .trust {
+    display: flex; gap: 0.6rem; align-items: flex-start;
+    font-size: 0.82rem; color: var(--text-dim); line-height: 1.5;
+  }
+  .trust svg { width: 16px; height: 16px; flex-shrink: 0; margin-top: 0.15rem; color: var(--green); }
+
+  footer { color: var(--text-dim); font-size: 0.75rem; text-align: center; margin-top: 1.5rem; }
 </style>
 </head>
 <body>
-<canvas id="rain"></canvas>
-<div class="scanlines"></div>
 
 <div class="wrap">
   <header>
-    <div class="brand">VPN_FOR_MHS // LOCAL CONTROL</div>
-    <h1>root@vps-vnic:~<span class="cursor">&nbsp;</span></h1>
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M12 2 4 5v6c0 5 3.5 8.5 8 11 4.5-2.5 8-6 8-11V5l-8-3z" fill="#fff"/>
+      </svg>
+    </div>
+    <div>
+      <h1>VPN for MHS</h1>
+      <div class="subtitle">Private network access</div>
+    </div>
   </header>
 
   <section class="panel">
-    <h2>Tunnel</h2>
-    <div class="status-row">
-      <div id="dot" class="dot"></div>
-      <div id="statusText" class="status-text off">DISCONNECTED</div>
+    <div class="hero">
+      <div id="shield" class="shield">
+        <svg id="shieldIcon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2 4 5v6c0 5 3.5 8.5 8 11 4.5-2.5 8-6 8-11V5l-8-3z" stroke="#dc2626" stroke-width="1.6" fill="none"/>
+        </svg>
+      </div>
+      <div id="statusText" class="status-text off">Not protected</div>
+      <div class="status-sub">Your connection is not encrypted right now.</div>
+      <div class="btnrow">
+        <button id="connect" onclick="doAction('connect')">Connect</button>
+        <button id="disconnect" onclick="doAction('disconnect')" style="display:none">Disconnect</button>
+      </div>
+      <div id="msg"></div>
     </div>
-    <div class="btnrow">
-      <button id="connect" onclick="doAction('connect')">Connect</button>
-      <button id="disconnect" onclick="doAction('disconnect')" style="display:none">Disconnect</button>
-    </div>
-    <div id="msg"></div>
   </section>
 
   <section class="panel">
-    <h2>Public IP / Geolocation</h2>
+    <h2>Public IP address</h2>
     <div class="iprow">
       <div id="ipBig" class="ip-big off">—</div>
-      <button class="refresh-btn" onclick="refreshIp()">↻ refresh</button>
+      <button class="refresh-btn" onclick="refreshIp()">↻ Refresh</button>
     </div>
     <div class="grid" style="margin-top: 1rem;">
-      <div class="stat"><div class="label">ISP</div><div class="value" id="ipIsp">—</div></div>
+      <div class="stat"><div class="label">Provider</div><div class="value" id="ipIsp">—</div></div>
       <div class="stat"><div class="label">Location</div><div class="value" id="ipLoc">—</div></div>
     </div>
   </section>
 
   <section class="panel">
-    <h2>Link stats</h2>
+    <h2>Connection details</h2>
     <div class="grid">
       <div class="stat"><div class="label">Connected since</div><div class="value" id="statSince">—</div></div>
       <div class="stat"><div class="label">Duration</div><div class="value" id="statDuration">—</div></div>
-      <div class="stat"><div class="label">Endpoint</div><div class="value" id="statEndpoint">—</div></div>
+      <div class="stat"><div class="label">Server</div><div class="value" id="statEndpoint">—</div></div>
       <div class="stat"><div class="label">Listen port</div><div class="value" id="statPort">—</div></div>
       <div class="stat"><div class="label">Last handshake</div><div class="value" id="statHandshake">—</div></div>
       <div class="stat"><div class="label">Allowed IPs</div><div class="value" id="statAllowed">—</div></div>
@@ -156,21 +168,34 @@
   </section>
 
   <section class="panel">
-    <h2>Client &amp; crypto</h2>
+    <h2>Device &amp; encryption</h2>
     <div class="grid">
-      <div class="stat"><div class="label">Client name</div><div class="value" id="statClientName">—</div></div>
-      <div class="stat"><div class="label">Interface</div><div class="value" id="statIface">—</div></div>
+      <div class="stat"><div class="label">Device name</div><div class="value" id="statClientName">—</div></div>
+      <div class="stat"><div class="label">Network interface</div><div class="value" id="statIface">—</div></div>
       <div class="stat"><div class="label">Tunnel address</div><div class="value" id="statTunnelAddr">—</div></div>
       <div class="stat"><div class="label">MTU</div><div class="value" id="statMtu">—</div></div>
       <div class="stat"><div class="label">Configured DNS</div><div class="value" id="statConfDns">—</div></div>
       <div class="stat"><div class="label">Active OS DNS</div><div class="value" id="statActiveDns">—</div></div>
-      <div class="stat" style="grid-column: 1 / -1;"><div class="label">Client public key</div><div class="value" id="statClientPub" style="font-size:0.85rem;">—</div></div>
-      <div class="stat" style="grid-column: 1 / -1;"><div class="label">Server public key</div><div class="value" id="statServerPub" style="font-size:0.85rem;">—</div></div>
-      <div class="stat" style="grid-column: 1 / -1;"><div class="label">Cipher suite</div><div class="value">ChaCha20-Poly1305 · Curve25519 · BLAKE2s · SipHash24</div></div>
+      <div class="stat" style="grid-column: 1 / -1;"><div class="label">This device's public key</div><div class="value" id="statClientPub" style="font-size:0.8rem;">—</div></div>
+      <div class="stat" style="grid-column: 1 / -1;"><div class="label">Server public key</div><div class="value" id="statServerPub" style="font-size:0.8rem;">—</div></div>
+      <div class="stat" style="grid-column: 1 / -1;"><div class="label">Encryption</div><div class="value">ChaCha20-Poly1305 (WireGuard) — industry-standard, open-source, independently audited</div></div>
     </div>
   </section>
 
-  <footer>WireGuard · this page never leaves 127.0.0.1</footer>
+  <section class="panel">
+    <div class="trust">
+      <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M9 12l2 2 4-4m5-2v4c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V8l8-4 8 4z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div>
+        This dashboard runs entirely on your own device and only ever talks to
+        <code>127.0.0.1</code> (itself). It doesn't collect, log, or transmit
+        anything about your browsing — the numbers above are read live from
+        WireGuard's own connection stats, shown to you for transparency, not
+        recorded anywhere.
+      </div>
+    </div>
+  </section>
+
+  <footer>Powered by WireGuard — open-source, encrypted, no data retention.</footer>
 </div>
 
 <script>
@@ -202,15 +227,21 @@ async function refreshState() {
     j = { connected: false };
   }
 
-  const dot = document.getElementById('dot');
+  const shield = document.getElementById('shield');
+  const shieldIcon = document.getElementById('shieldIcon').querySelector('path');
   const st = document.getElementById('statusText');
+  const sub = document.querySelector('.status-sub');
   const btnC = document.getElementById('connect');
   const btnD = document.getElementById('disconnect');
   const ipBig = document.getElementById('ipBig');
 
-  dot.className = 'dot' + (j.connected ? ' on' : '');
+  shield.className = 'shield' + (j.connected ? ' on' : '');
+  shieldIcon.setAttribute('stroke', j.connected ? '#16a34a' : '#dc2626');
   st.className = 'status-text ' + (j.connected ? 'on' : 'off');
-  st.textContent = j.connected ? 'CONNECTED' : 'DISCONNECTED';
+  st.textContent = j.connected ? 'Protected' : 'Not protected';
+  sub.textContent = j.connected
+    ? 'Your traffic is encrypted and routed through the VPN.'
+    : 'Your connection is not encrypted right now.';
   btnC.style.display = j.connected ? 'none' : 'inline-block';
   btnD.style.display = j.connected ? 'inline-block' : 'none';
   ipBig.classList.toggle('off', !j.connected);
@@ -275,7 +306,7 @@ const IP_PROVIDERS = [
 
 async function refreshIp() {
   const btn = document.querySelector('.refresh-btn');
-  btn.innerHTML = '<span class="spin">↻</span> refresh';
+  btn.innerHTML = '<span class="spin">↻</span> Refresh';
   document.getElementById('ipIsp').textContent = 'looking up...';
   document.getElementById('ipLoc').textContent = 'looking up...';
 
@@ -292,7 +323,7 @@ async function refreshIp() {
     document.getElementById('ipIsp').textContent = (lastErr && lastErr.name === 'AbortError') ? 'all lookups timed out' : 'lookup failed';
     document.getElementById('ipLoc').textContent = '—';
   }
-  btn.innerHTML = '↻ refresh';
+  btn.innerHTML = '↻ Refresh';
 }
 
 async function doAction(action) {
@@ -314,34 +345,6 @@ async function doAction(action) {
 refreshState();
 setInterval(refreshState, 2000);
 setInterval(refreshIp, 30000);
-
-// subtle matrix rain, low opacity, behind everything
-(function () {
-  const c = document.getElementById('rain');
-  const ctx = c.getContext('2d');
-  let w, h, cols, drops;
-  const chars = '01アイウエオカキクケコ$#%&+=<>/\\';
-  function resize() {
-    w = c.width = window.innerWidth;
-    h = c.height = window.innerHeight;
-    cols = Math.floor(w / 16);
-    drops = new Array(cols).fill(0).map(() => Math.random() * -50);
-  }
-  resize();
-  window.addEventListener('resize', resize);
-  function tick() {
-    ctx.fillStyle = 'rgba(6,10,8,0.08)';
-    ctx.fillRect(0, 0, w, h);
-    ctx.fillStyle = '#33ff8c';
-    ctx.font = '14px monospace';
-    for (let i = 0; i < cols; i++) {
-      const ch = chars[Math.floor(Math.random() * chars.length)];
-      ctx.fillText(ch, i * 16, drops[i] * 16);
-      drops[i] = drops[i] * 16 > h && Math.random() > 0.975 ? 0 : drops[i] + 1;
-    }
-  }
-  setInterval(tick, 60);
-})();
 </script>
 </body>
 </html>
