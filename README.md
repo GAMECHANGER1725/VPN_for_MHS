@@ -2,16 +2,19 @@
 
 A self-hosted WireGuard VPN running on a free-tier Oracle Cloud VM.
 
-> **Project status: Phase 3 (Minimal working VPN) — in progress on Oracle Cloud.**
+> **Project status: multi-client tunnel confirmed working — a MacBook and an
+> Android phone are both connected to the Oracle Cloud VM as independent
+> WireGuard peers.**
 >
 > The original design ran the server on a MacBook Air M2, on the theory that
 > zero-cost meant no cloud component. Phase 1 reconnaissance on the home
 > network, plus the practical reality of keeping a laptop always-on and
 > reachable, made a small free-tier cloud VM the better trade: still zero
 > recurring cost, but always-on and directly reachable with no CGNAT, no
-> port-forwarding, and no dependency on a laptop staying awake. See
-> [docs/architecture.md](docs/architecture.md) for the full reasoning and the
-> decision points that led here.
+> port-forwarding, and no dependency on a laptop staying awake. Neither
+> client's tunnel depends on the other device, or on any terminal session,
+> being on. See [docs/architecture.md](docs/architecture.md) for the full
+> reasoning and the decision points that led here.
 
 ---
 
@@ -192,6 +195,7 @@ bin/
   upnp-wan-ip.py     Router WAN address query via UPnP IGD (read-only)
   stun-probe.py      Outbound-UDP test via STUN (read-only)
   vpn-connect-ui.py  Local-only Connect/Disconnect web UI for the macOS client
+  vpn-connect-ui.html  The dashboard page served by vpn-connect-ui.py
 tests/
   run-all.sh         Run every suite + syntax + shellcheck
   test-stun.py       STUN message parser
@@ -244,10 +248,10 @@ key will ever be committed, logged, or printed unless you explicitly export it.
 | 1 | Reconnaissance | superseded — home network reachability no longer gates the design once the server is cloud-hosted |
 | 2 | Architecture | **decided: Oracle Cloud Always Free VM is the server**, see docs/architecture.md |
 | 3 | Minimal working VPN, one client | **done** — full-tunnel verified end-to-end from a Mac client |
-| 4 | Routing / NAT | not started |
-| 5 | DNS | not started |
+| 4 | Routing / NAT | **done** — MASQUERADE + FORWARD rules on the server, confirmed with two independent peers connected simultaneously |
+| 5 | DNS | not started — clients get a public resolver (`1.1.1.1`) directly; the on-VM forwarder from DECISION 3 is still unbuilt |
 | 5b | TCP/443 cloak (wstunnel) for UDP-blocked networks | **designed** ([obfuscation.md](docs/obfuscation.md)); build not started |
-| 6 | Peer management | not started |
+| 6 | Peer management | **manual process confirmed working** (laptop + Android phone, added by hand over SSH) — see [docs/architecture.md](docs/architecture.md#adding-a-new-peer-current-manual-process); `bin/vpn peer add` automation not started |
 | 7 | CLI | not started |
 | 8 | Monitoring | not started |
 | 9 | Automation / recovery | not started |

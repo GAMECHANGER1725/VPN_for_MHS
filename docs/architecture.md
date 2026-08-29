@@ -162,6 +162,78 @@ file exists but cannot read its contents without this grant — a plain
 on the same path succeeds, since existence only needs directory search
 permission while reading the contents needs the file's own read bit.
 
+## Adding a new peer (current manual process)
+
+No `bin/vpn peer add` yet (Phase 6, not started) — every peer so far (the
+Mac, then an Android phone) was added by hand over SSH. Documenting the
+real steps so the eventual automation has a tested procedure to match,
+and so a second peer doesn't have to be re-derived from scratch:
+
+1. **Generate the keypair and preshared key on the client device itself**,
+   never on the server — the private key must never leave the device it
+   belongs to:
+   ```
+   wg genkey | tee client_private.key | wg pubkey > client_public.key
+   wg genpsk > client_preshared.key
+   ```
+2. **Pick the next free address** in the VPN subnet (`10.77.0.0/24`; server
+   is `.1`). Peers so far: laptop `10.77.0.2/32`, Android phone
+   `10.77.0.3/32`.
+3. **Append the peer to the server's `/etc/wireguard/wg0.conf`** using only
+   the public key and preshared key (both non-secret in the sense that
+   leaking either alone doesn't grant access — the private key does that):
+   ```
+   sudo tee -a /etc/wireguard/wg0.conf > /dev/null <<EOF
+
+   [Peer]
+   PublicKey = <client public key>
+   PresharedKey = <client preshared key>
+   AllowedIPs = <assigned address>/32
+   EOF
+   ```
+4. **Hot-reload without dropping already-connected peers.** The obvious
+   `sudo wg syncconf wg0 <(wg-quick strip wg0)` fails with `fopen: No such
+   file or directory` — the `<(...)` process substitution runs as the
+   invoking user, but `wg-quick strip` needs root to read the 600-permission
+   config, so the substitution produces nothing for `sudo` to read. Route
+   through a temp file instead:
+   ```
+   sudo wg-quick strip wg0 > /tmp/wg0.stripped
+   sudo wg syncconf wg0 /tmp/wg0.stripped
+   rm /tmp/wg0.stripped
+   ```
+   `wg syncconf` (unlike `wg-quick down` + `up`) never tears down the
+   interface, so peers already connected keep their session.
+5. **Build the client's own config** on the client device, referencing the
+   server's public key (`sudo wg show wg0 public-key`) and reserved IP:
+   ```
+   [Interface]
+   PrivateKey = <client private key>
+   Address = <assigned address>/32
+   DNS = 1.1.1.1
+
+   [Peer]
+   PublicKey = <server public key>
+   PresharedKey = <client preshared key>
+   Endpoint = <server reserved IP>:51820
+   AllowedIPs = 0.0.0.0/0
+   PersistentKeepalive = 25
+   ```
+6. **Get it onto the device.** For a phone, `qrencode -t ansiutf8 < client.conf`
+   prints a QR straight into the terminal that the WireGuard app's camera
+   import reads directly — no file transfer needed. For a second computer,
+   copy the `.conf` file itself.
+7. **Verify**: `sudo wg show wg0` on the server should show the new peer
+   with a real `endpoint` and a recent `latest handshake` once the client
+   connects — before that, both fields are blank.
+
+Confirmed independent of each other: closing the SSH session to the server,
+or shutting down the Mac entirely, affects neither peer's tunnel. WireGuard
+runs as a kernel-level interface, not a process tied to any terminal or
+client device. The one process that *is* terminal-bound is
+`bin/vpn-connect-ui.py` (the Mac's local dashboard) — closing its tab kills
+the dashboard's web server, not the tunnel it controls.
+
 ---
 
 ## Planned layout
