@@ -35,6 +35,24 @@ Concretely, in descending order of likelihood, a school blocks a VPN by:
 The research spends most of its length on rows 5–7, which we already beat, and
 barely mentions rows 1–3, which are the ones that will actually stop us.
 
+**Concrete threat intel, confirmed 2026-08-30, permanent project record:** the
+target network is a DET (Australian public-school) network running **Palo
+Alto** filtering, and it blocks **Cloudflare WARP / 1.1.1.1 by name** — DET's
+stated rationale is forcing all traffic through official, monitored DNS and
+blocking "unauthorized VPN protocols." This confirms the filter does active,
+vendor-grade App-ID/category-based blocking, not just naive port/keyword
+rules. It does not automatically doom Tier 2's CDN-fronting plan — WARP is a
+distinct consumer VPN app with its own recognisable protocol signature,
+architecturally unrelated to VLESS-over-WebSocket relayed through a Cloudflare
+Worker, which just looks like ordinary HTTPS/WebSocket traffic to some
+website. But Palo Alto's PAN-DB URL categorisation is separate from App-ID
+signature matching, and `*.workers.dev` is a well-known, heavily-abused
+proxy-hosting namespace — plausible enough that a K-12 filtering profile has
+it pre-categorised under something block-worthy regardless of what is
+actually happening inside the tunnel. **This cannot be resolved by more
+research or engineering, only by testing on the real network** (Tier 3,
+below).
+
 **This is the single most important finding.** Reality is over-engineered for
 this threat model in one dimension (handshake indistinguishability) and
 under-engineered in another (where the packets are going, and whether we can
@@ -208,8 +226,21 @@ live in the same cloud/ASN as our VM, so the SNI↔IP join stops being anomalous
   Cloudflare terminates TLS at its edge; VLESS carries no encryption of its
   own, so the CF→origin leg must itself be TLS or Cloudflare can read the
   stream.
-- **Cost:** a domain (~$10/yr — breaks strict zero-cost) plus Cloudflare's free
-  tier.
+- **Cost:** zero, using a free Cloudflare Workers `*.workers.dev` subdomain
+  instead of a purchased domain — no `~$10/yr` domain needed. Free tier only
+  needs an email signup, no payment method. **Real caveat, not previously
+  documented:** Cloudflare's Workers ToS prohibits using Workers for VPN/proxy
+  traffic, and flags heavy usage for account suspension. This risk is inherent
+  to the architecture (relaying VLESS through a Worker), not to the choice of
+  `workers.dev` vs. a paid domain — accepted here as a known trade-off, not an
+  oversight.
+
+**Decision made (owner call, 2026-08-30):** Option C, as a **second Xray
+inbound alongside the existing Reality inbound** — not a replacement. See
+[session-state.md](session-state.md) for build status; as of this date it is
+**blocked** on there being no Cloudflare account/API token available in this
+environment (free to create, but sign-up is an interactive, human-only step —
+not something an autonomous run should do on the owner's behalf).
 
 **Assessment:** Option C is the strongest answer to the threat model we
 actually face, and the weakest answer to the project's founding principle of
@@ -222,11 +253,21 @@ The pragmatic route is **B now, C as a second profile in the client** — two
 configs, switch when one stops working. Redundancy beats trying to build one
 perfect tunnel.
 
+**A clean build of Option C is not the same as a working one.** Even once
+deployed, a `*.workers.dev` hostname is a plausible target for exactly the
+kind of category-based filtering DET's Palo Alto already does to Cloudflare
+WARP (see §1's threat-intel note) — this is unverified until tested on the
+real network, regardless of how cleanly the Worker and second inbound build
+and handshake in isolation.
+
 ---
 
 ## 4. The pathway
 
 ### Tier 0 — Do first. Cheap, high-impact, no decisions required.
+
+**Status as of 2026-08-30: items 1–6 done and measured, item 7 still open.**
+See [session-state.md](session-state.md) for exact verification evidence.
 
 1. **Audit what our IP exposes.** From an off-network host:
    ```sh
@@ -305,17 +346,20 @@ perfect tunnel.
 
 ## 5. Decisions that need an owner
 
-These are not technical unknowns; they are choices about what this project is.
+These were live questions before 2026-08-30. All three are now resolved by the
+project owner; recorded here so a future session doesn't re-litigate them.
 
-1. **Third party in the data path — yes or no?** Option C is the strongest
+1. **Third party in the data path — yes or no?** ~~Option C is the strongest
    available design and violates the founding "genuinely self-hosted"
-   principle. Both answers are defensible; the project should state which it
-   picked and why, rather than drifting.
-2. **Reconcile [limitations.md](limitations.md) §9.** The stated non-goal of
-   filter-defeating tooling no longer matches what is built. Amend it honestly.
-3. **Is WireGuard still worth keeping?** It costs us the "just a web server"
-   story on our only IP, and Reality covers every network WireGuard covers.
-   Keeping it needs a reason.
+   principle.~~ **Resolved: yes.** Option C, as a second inbound alongside
+   Reality — see §3 above for status.
+2. **Reconcile [limitations.md](limitations.md) §9.** ~~The stated non-goal of
+   filter-defeating tooling no longer matches what is built.~~ **Resolved:**
+   amended 2026-08-30.
+3. **Is WireGuard still worth keeping?** ~~It costs us the "just a web server"
+   story on our only IP, and Reality covers every network WireGuard
+   covers.~~ **Resolved: no.** Retired 2026-08-30 — service stopped and
+   disabled, its firewall rule removed, config left in place.
 
 ---
 

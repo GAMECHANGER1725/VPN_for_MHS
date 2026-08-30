@@ -58,6 +58,27 @@ It is only partially transferable. Treat it accordingly.
 - **Report measured results, not expected ones.** If a check was not run, say
   so. Several past bugs were prolonged by assuming a command had taken effect.
 
+## Legacy WireGuard codebase
+
+`bin/`, `lib/`, and `tests/` are the original WireGuard-on-Mac/VM tooling —
+still present and still tested, but not where the Reality/Xray work happens
+(that's all on the VM, in `/usr/local/etc/xray/config.json` and shell
+history, not in this repo).
+
+- `bin/vpn` is a thin dispatcher (`init`, `peer add/list/show/export/remove`,
+  `start/stop/restart`, `status`, `doctor`); real logic lives in `lib/*.sh`
+  (`common.sh`, `ipam.sh`, `keys.sh`, `config.sh`, `peers.sh`) so it's unit
+  testable. Secret material is only ever read in `bin/vpn`/`lib/keys.sh` and
+  passed by value, never logged.
+- `bin/vpn-doctor` is a read-only macOS network/reachability auditor (run it
+  before touching sysctls, pf, or routes). `--client-check` answers "can a
+  WireGuard client get out from this network" with one STUN round trip.
+- Run the whole suite with `tests/run-all.sh` (bash syntax + python syntax +
+  `test-*.sh` unit suites); run one file directly, e.g. `bash
+  tests/test-ipam.sh`, when iterating on a single `lib/*.sh` module.
+- Live state (keys, peer configs, IPAM) lives under `~/.config/vpn-for-mhs`,
+  outside the repo — the working tree holds code only.
+
 ## Environment differences
 
 A session running **locally on the Mac** has a shell on the Mac and SSH to the
