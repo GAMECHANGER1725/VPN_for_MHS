@@ -106,7 +106,12 @@ Spotlight-indexing bug that breaks App Store installs) and that `sudo` call
 needs an interactive terminal password — it cannot be supplied
 non-interactively, and this run does not attempt to (entering an admin
 password is exactly the kind of human-only step this plan is meant to stop
-at, not work around).
+at, not work around). Checked for a legitimate bypass first: `mas` does
+expose `MAS_NO_AUTO_INDEX=1`, but that env var controls a different feature
+(post-install Spotlight re-indexing) and does not skip the pre-install
+`mdutil` call — confirmed by trying it, still prompts for sudo. There is no
+flag-based way around this; it is a genuine one-time human step, not a gap in
+this session's effort.
 
 **What's needed from a human:** open a real terminal (not this automated
 session) and run:
@@ -206,9 +211,15 @@ replacement; `limitations.md` §9 — reconciled; WireGuard — retired.
 Nothing in this project has been tested on the school network. Whether the
 filter does TLS interception, proxy-only egress, or ASN-category blocking is
 **pure speculation** right now, and those are the three things most likely to
-defeat the current design. This session added one more concrete fact — DET's
-Palo Alto filter blocks Cloudflare WARP by name — but that is corroborating
-threat intel, not a substitute for the real test.
+defeat the current design. This session added two concrete facts, both
+recorded permanently in [stealth-roadmap.md](stealth-roadmap.md) §1: DET's
+Palo Alto filter blocks Cloudflare WARP by name, and — more seriously — **DET
+NSW blocks Xray/V2Ray-core protocol clients outright**, which is
+protocol-level detection, not just destination-reputation. Neither of these
+is a substitute for the real test; if anything, the second one raises the
+priority of that test above the Tier 1/2 work, since it questions whether
+Reality's core "indistinguishable handshake" premise holds against this
+specific filter at all.
 
 One session on that network answers all three. If a session is running on the
 Mac while connected to that network, that test takes priority over every other

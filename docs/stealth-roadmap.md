@@ -53,6 +53,26 @@ actually happening inside the tunnel. **This cannot be resolved by more
 research or engineering, only by testing on the real network** (Tier 3,
 below).
 
+**Second, more direct threat intel, confirmed by the project owner
+2026-08-30, permanent project record:** DET NSW (the target network's actual
+operator — a NSW Department of Education network) blocks **Xray/V2Ray-core
+protocol clients** outright, not just Cloudflare WARP. This is a materially
+bigger problem than the SNI↔ASN mismatch above: it implies detection at the
+protocol-client level, not merely the destination-reputation level. Reality's
+entire design premise is that its handshake is indistinguishable from genuine
+TLS to `dest` — if DET's block is a Palo Alto App-ID signature keyed on
+V2Ray/Xray's TLS *behaviour* (not just known SNIs or IP ranges), Reality could
+still get flagged even after Tier 1's ASN fix, because App-ID and PAN-DB URL
+categorisation are separate detection layers (as already noted above for
+`workers.dev`). Exactly what "blocked" means here — an App-ID signature
+match, a blocked IP/ASN range shared with known Xray providers, TLS
+fingerprint heuristics, or something else — is **unknown and cannot be
+determined without testing on the real network with this specific
+deployment**. Do not treat this as disproving the current design; treat it as
+raising the priority of Tier 3's real-network test above everything else in
+this document, including Tier 1/2 work that assumes the protocol itself is
+invisible.
+
 **This is the single most important finding.** Reality is over-engineered for
 this threat model in one dimension (handshake indistinguishability) and
 under-engineered in another (where the packets are going, and whether we can
