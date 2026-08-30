@@ -11,22 +11,32 @@ Tier 0/1 waterfall plan (stages 0–5).
 ## Where things actually stand
 
 **Working:** VLESS+Reality on `137.23.22.149:443`, `dest`/`sni` =
-`itunes.apple.com`. Verified carrying real traffic (exit IP confirmed as the
-VM). Xray restarted mid-session (loglevel change, below) and the handshake was
-re-verified genuine afterward. Client is Hiddify on macOS in **"Proxy service
-only"** mode, SOCKS on `127.0.0.1:12334`.
+`itunes.apple.com`. Verified carrying real traffic. Xray restarted mid-session
+(loglevel change, below) and the handshake was re-verified genuine afterward.
 
-**Broken:** Hiddify's **VPN / TUN mode** — root cause confirmed (not
-re-diagnosed this session): Hiddify's bundle has no `.appex` and is ad-hoc
-signed (`TeamIdentifier=not set`), so macOS never registers a
-NetworkExtension from it. The Console.app/Notification-Center checks the
-roadmap once proposed are moot given this. Fix in progress this session: swap
-to a properly-signed client (Karing) — see Stage 3 below, **blocked** on a
-one-time interactive step.
+**Client swap done — TUN mode fixed.** Karing (properly signed,
+`TeamIdentifier=TNPM9PFX3W`) replaces Hiddify as of this session. Configured
+with the same Reality profile (regenerated `vless://` link from the VM's
+`config.json` + `xray x25519`, transferred via clipboard only, never written
+to disk or printed in any transcript). Switched to VPN/TUN mode, connected:
+`scutil --nc list` shows `VPN (com.nebula.karing) "Karing" — (Connected)`,
+default route is `utun4`, and `curl https://api.ipify.org` returns
+`137.23.22.149` (the VM) — genuinely routing, not just configured.
 
-**Consequence of that break:** the system-wide SOCKS proxy is a workaround
-that causes "no internet when disconnected" — unchanged this session, pending
-the Stage 3 client swap.
+**Root cause and fix, confirmed:** Hiddify's bundle had no `.appex` and was
+ad-hoc signed (`TeamIdentifier=not set`), so macOS never registered a
+NetworkExtension from it. Karing uses the classic `NEVPNManager` /
+`NETunnelProviderManager` API instead of a `.appex` System Extension — its
+permission gate is a "Karing Would Like to Add VPN Configurations" dialog,
+not the System-Extension "Allow" prompt the plan expected, and
+`systemextensionsctl list` correctly shows 0 extensions even while connected
+(that check doesn't apply to this app's connection mechanism — don't treat 0
+there as a failure signal for Karing).
+
+**Hiddify** is no longer the active client; not uninstalled, just superseded.
+The "no internet when disconnected" bug tied to Hiddify's SOCKS-proxy
+workaround no longer applies — Karing in TUN mode has no equivalent failure
+mode (direct traffic isn't proxy-dependent the same way).
 
 ---
 
@@ -98,36 +108,54 @@ stopped.
 
 ### Stage 3 — macOS client swap
 
-**Blocked**, not completed. `mas` (App Store CLI) is installed and this Mac is
-signed in (confirmed: `mas outdated` and `mas search` both work without
-error). But `mas install 6472431552` (Karing) fails because mas 7.0.0
-internally shells out to `sudo mdutil -Eai on` (a workaround for a known
-Spotlight-indexing bug that breaks App Store installs) and that `sudo` call
-needs an interactive terminal password — it cannot be supplied
-non-interactively, and this run does not attempt to (entering an admin
-password is exactly the kind of human-only step this plan is meant to stop
-at, not work around). Checked for a legitimate bypass first: `mas` does
-expose `MAS_NO_AUTO_INDEX=1`, but that env var controls a different feature
-(post-install Spotlight re-indexing) and does not skip the pre-install
-`mdutil` call — confirmed by trying it, still prompts for sudo. There is no
-flag-based way around this; it is a genuine one-time human step, not a gap in
-this session's effort.
+**Done and verified end-to-end.**
 
-**What's needed from a human:** open a real terminal (not this automated
-session) and run:
+`mas install 6472431552` (Karing) initially failed two different ways, both
+resolved:
 
-```sh
-sudo mdutil -Eai on        # one-time; enter your Mac password when prompted
-mas install 6472431552     # Karing
-```
+1. `mas` 7.0.0 shells out to `sudo mdutil -Eai on` (a Spotlight-indexing
+   workaround) before installing, which needs an interactive password —
+   checked for a bypass (`MAS_NO_AUTO_INDEX=1`, confirmed it doesn't skip
+   this call), found none, so this run stopped and asked the human to run it.
+   Resolved: the project owner ran `sudo mdutil -Eai on` +
+   `mas install 6472431552` directly.
+2. Even with sudo handled, `mas install` still failed:
+   **"Redownload Unavailable with This Apple Account"** — Karing had never
+   been "purchased" (free) under this Apple ID, so the CLI couldn't redownload
+   it. This is an App Store account-state issue, not an `mas`/`mdutil` issue.
+   Resolved: the owner opened the App Store GUI and clicked Get/Install once,
+   which associates the free app with the account; after that it's installed.
 
-Then re-run this stage: verify with `codesign -dv --verbose=4` on
-`/Applications/Karing.app` (expect a real `TeamIdentifier`, not `not set`),
-configure it with the existing Reality client profile from the VM, switch to
-VPN/TUN mode, approve the one macOS "Allow system extension" prompt (the
-single click this whole plan has always expected a human to make), then
-verify `systemextensionsctl list` shows it registered and
-`curl https://api.ipify.org` through the tunnel returns the VM's IP.
+**Signature verified:** `codesign -dv --verbose=4 /Applications/Karing.app` —
+`Authority=Apple Mac OS Application Signing`, `TeamIdentifier=TNPM9PFX3W`.
+Genuinely signed, not ad-hoc. This is the actual fix for the root cause
+identified earlier (Hiddify: no `.appex`, `TeamIdentifier=not set`).
+
+**Configured:** the Reality client profile was regenerated directly from the
+VM's live config (`/usr/local/etc/xray/config.json`'s UUID/SNI/short-ID, plus
+`xray x25519 -i <privateKey>` to derive the public key — the public key isn't
+stored in config.json itself) as a `vless://` URI, piped straight from the
+SSH session into this Mac's clipboard (`| pbcopy`) so it was never printed
+into any transcript or written to any file. The owner pasted it into Karing's
+"Add Profile Link" screen and saved it.
+
+**Connected and verified working:**
+- `scutil --nc list` → `* (Connected)   ... VPN (com.nebula.karing) "Karing"`
+- `netstat -rn` → default route via `utun4`
+- `curl https://api.ipify.org` → `137.23.22.149` (the VM, not the home IP)
+
+**One surprise, resolved:** no macOS "Allow system extension" prompt ever
+appeared, and `systemextensionsctl list` shows `0 extension(s)` even while
+connected. This isn't a failure — Karing uses the classic
+`NEVPNManager`/`NETunnelProviderManager` VPN API, not a `.appex` System
+Extension, so its permission gate is a one-time "Karing Would Like to Add VPN
+Configurations" dialog instead. The `systemextensionsctl list` check the
+original plan specified was calibrated for Hiddify's (broken) approach and
+doesn't apply here — don't read `0 extension(s)` as a bad sign for Karing.
+
+Hiddify is no longer configured as the active client (superseded, not
+uninstalled). The "no internet when disconnected" bug tied to its SOCKS-proxy
+workaround no longer applies.
 
 ### Stage 4 — Docs reconciliation
 
@@ -174,12 +202,15 @@ the actual filter.
 
 ## Immediate next actions
 
-1. **Stage 3, human step**: `sudo mdutil -Eai on` + `mas install 6472431552`
-   in an interactive terminal, then resume the client-swap verification.
+1. ~~Stage 3, human step~~ — **done**. Karing installed, signed, configured,
+   connected, and verified carrying real traffic to the VM.
 2. **Stage 5, human step**: free Cloudflare sign-up + `wrangler` auth, then
-   resume the CDN-fronting build.
-3. **The school-network test** — see below. Outranks everything else once a
-   session is running on that network.
+   resume the CDN-fronting build. Worth reconsidering first given the
+   DET/Xray-V2Ray-block finding above — may not be worth building before the
+   real-network test regardless.
+3. **The school-network test** — see below. Now the single most important
+   remaining item: it can be run today, since a working TUN-mode client
+   exists for the first time this project has had one.
 
 ---
 
