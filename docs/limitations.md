@@ -225,9 +225,16 @@ Recorded so no one mistakes silence for a pass:
 - Obscurity as a security measure. Changing the UDP port off 51820 reduces log
   noise from mass scanners. It is not a security control and will never be
   described as one.
-- Tooling whose purpose is defeating a network filter. Trying an alternative
-  UDP port is ordinary configuration and is supported. Wrapping the tunnel in
-  TCP to get past a network that deliberately blocks UDP circumvents someone's
-  policy rather than solving a technical problem, and is out of scope.
 - Weakening security to make the setup work. If the secure path is blocked,
   this project reports BLOCKED rather than lowering the bar.
+
+**Stale as of 2026-08.** This bullet used to read: "Tooling whose purpose is
+defeating a network filter... is out of scope." That stopped being true when
+the project adopted VLESS+Reality specifically to evade DPI-based blocking,
+and it is now further from true with CDN-fronting (Cloudflare Workers) added
+as a second inbound to defeat IP/ASN-reputation and category-based blocking.
+The project deliberately crossed this line — see
+[stealth-roadmap.md](stealth-roadmap.md) §1 for why the threat model changed
+from "avoid looking like a VPN by accident" to "actively evade a school
+network filter." What remains a non-goal, unchanged: weakening cryptography,
+or lying about what the tooling does.

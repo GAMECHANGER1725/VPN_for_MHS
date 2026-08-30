@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nmap:*)", "Bash(dig:*)", "Bash(whois:*)", "Bash(host:*)",
+      "Bash(curl:*)", "Bash(openssl s_client:*)", "Bash(traceroute:*)",
+      "Bash(nc:*)", "Bash(ss:*)", "Bash(lsof:*)", "Bash(scutil:*)",
+      "Bash(networksetup -listallnetworkservices)",
+      "Bash(networksetup -getsocksfirewallproxy:*)",
+      "Bash(codesign:*)", "Bash(systemextensionsctl list)",
+      "Bash(log show:*)", "Bash(git:*)"
+    ],
+    "deny": [
+      "Bash(iptables -F:*)", "Bash(iptables -X:*)", "Bash(iptables -P:*)",
+      "Bash(sudo iptables -F:*)", "Bash(sudo iptables -X:*)",
+      "Bash(sudo iptables -P:*)", "Bash(ufw:*)", "Bash(rm -rf:*)"
+    ]
+  }
+}

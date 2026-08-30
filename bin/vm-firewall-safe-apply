@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Apply an iptables change on the VM with a rollback net, per CLAUDE.md's
+# hard rule: back up, schedule an automatic restore, verify over a SECOND
+# independent SSH connection, then cancel the rollback.
+#
+# Usage: bin/vm-firewall-safe-apply <path-to-script-of-iptables-commands>
+#
+# The script file is a plain list of `iptables ...` commands (run with sudo
+# on the VM). Exits nonzero and leaves the scheduled rollback in place if
+# verification fails — the VM repairs itself in ROLLBACK_SECONDS.
+
+set -euo pipefail
+
+VM_HOST="ubuntu@137.23.22.149"
+VM_SSH_KEY="$HOME/.ssh/oci_vpn2"
+ROLLBACK_SECONDS=600
+BACKUP_DIR="$HOME/.config/vpn-for-mhs/firewall-backups"
+
+rules_script="${1:?usage: vm-firewall-safe-apply <path-to-iptables-commands-file>}"
+[[ -f "$rules_script" ]] || { echo "No such file: $rules_script" >&2; exit 1; }
+
+ssh_vm() { ssh -i "$VM_SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 "$VM_HOST" "$@"; }
+
+mkdir -p "$BACKUP_DIR"
+ts="$(date +%Y%m%dT%H%M%S)"
+backup_remote="/root/iptables-backup-${ts}.rules"
+backup_local="${BACKUP_DIR}/iptables-backup-${ts}.rules"
+
+echo "==> Backing up current ruleset to ${backup_remote} (and locally)"
+ssh_vm "sudo iptables-save | sudo tee ${backup_remote} >/dev/null"
+ssh_vm "sudo cat ${backup_remote}" > "$backup_local"
+echo "    local copy: $backup_local"
+
+echo "==> Scheduling automatic rollback in ${ROLLBACK_SECONDS}s (systemd-run, atd not installed)"
+unit="fw-rollback-${ts}"
+ssh_vm "sudo systemd-run --on-active=${ROLLBACK_SECONDS} --unit=${unit} \
+    bash -c 'iptables-restore < ${backup_remote}'"
+echo "    rollback unit: ${unit}.timer"
+
+echo "==> Applying requested rule changes"
+scp -i "$VM_SSH_KEY" -o BatchMode=yes "$rules_script" "${VM_HOST}:/tmp/fw-apply-${ts}.sh" >/dev/null
+ssh_vm "sudo bash /tmp/fw-apply-${ts}.sh && rm -f /tmp/fw-apply-${ts}.sh"
+
+echo "==> Verifying over a SECOND, independent SSH connection"
+verified=0
+for attempt in 1 2 3; do
+    if ssh -i "$VM_SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 \
+        -o ControlMaster=no -o ControlPath=none \
+        "$VM_HOST" 'echo VERIFY_OK' 2>/dev/null | grep -q VERIFY_OK; then
+        verified=1
+        break
+    fi
+    sleep 3
+done
+
+if [[ "$verified" -eq 1 ]]; then
+    echo "==> Verified. Cancelling scheduled rollback."
+    ssh_vm "sudo systemctl stop ${unit}.timer ${unit}.service 2>/dev/null; sudo systemctl reset-failed ${unit}.service 2>/dev/null || true"
+    echo "==> Current ruleset:"
+    ssh_vm "sudo iptables-save"
+    exit 0
+else
+    echo "!! Second-connection verification FAILED." >&2
+    echo "!! Rollback unit ${unit}.timer is still scheduled — VM will restore itself in ~${ROLLBACK_SECONDS}s." >&2
+    exit 1
+fi
