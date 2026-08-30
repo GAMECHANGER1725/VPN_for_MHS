@@ -281,12 +281,18 @@ The pragmatic route is **B now, C as a second profile in the client** — two
 configs, switch when one stops working. Redundancy beats trying to build one
 perfect tunnel.
 
-**A clean build of Option C is not the same as a working one.** Even once
-deployed, a `*.workers.dev` hostname is a plausible target for exactly the
-kind of category-based filtering DET's Palo Alto already does to Cloudflare
-WARP (see §1's threat-intel note) — this is unverified until tested on the
-real network, regardless of how cleanly the Worker and second inbound build
-and handshake in isolation.
+**A clean build of Option C is not the same as a working one — tested,
+2026-08-31, and it doesn't survive.** On DET's actual network, both Reality
+and the CDN-fronted path connect and then carry zero traffic, with a direct
+browser request actively closed (`ERR_CONNECTION_CLOSED`) rather than timing
+out — see [session-state.md](session-state.md) for the full result. This
+matches DPI killing the protocol mid-connection, not a naive destination or
+category block, which is consistent with — and now first-hand confirms —
+§1's DET/Xray-V2Ray-block finding. Fronting the same protocol through
+Cloudflare did not change the outcome. Whether it was specifically the
+`workers.dev` category block or the protocol-level block that caught the CDN
+path can't be distinguished from this result alone; either way, the result
+is the same.
 
 ---
 
@@ -360,19 +366,28 @@ See [session-state.md](session-state.md) for exact verification evidence.
 
 ### Tier 3 — Measure, don't assume.
 
-12. **The only test that matters is a test from the target network.** Every
-    other check in this document is a proxy for it. Record what actually
-    happens: does the TCP connection open, does the handshake complete, does
-    traffic flow, and if it fails, at which stage.
+12. ~~**The only test that matters is a test from the target network.**~~
+    **Done, 2026-08-31.** Both TCP connections open and the WS/TLS handshake
+    completes (Karing shows "Connected," connections register) — but **no
+    traffic flows either direction**, and a direct HTTP request gets
+    actively closed rather than timing out. That's the answer for both
+    Reality and CDN-fronted: they get *past* connect, and fail once real
+    protocol data starts moving. See [session-state.md](session-state.md)
+    for the full write-up.
 13. Measure the real client→server ClientHello with a capture, not a web
     service:
     ```sh
     sudo tcpdump -i any -s0 -w /tmp/ch.pcap "host <IP> and port 443"
     ```
-    then extract the JA4 from the first ClientHello. This is the measurement
-    the research got wrong.
+    then extract the JA4 from the first ClientHello. **Still not done** —
+    would require a capture taken from the school network itself, which item
+    12's test didn't include. Worth doing on a future visit if the ClientHello
+    fingerprint itself is ever in question — right now the failure looks
+    like it happens *after* the handshake, not at it, so this is lower
+    priority than it looked before item 12 landed.
 14. Watch the server's Xray log for handshake failures from addresses that are
     not ours — that is what active probing would look like if it ever happened.
+    **Still not done.**
 
 ---
 
@@ -397,11 +412,26 @@ project owner; recorded here so a future session doesn't re-litigate them.
 
 ## 6. What remains genuinely unknown
 
-- Whether the target network does TLS interception, uses explicit-proxy-only
-  egress, or blocks hosting ASNs by category. All three are answerable with one
-  session on that network and are currently pure speculation.
+- **Resolved, 2026-08-31, and worse than the speculative version of this
+  bullet used to say:** the target network doesn't need TLS interception or
+  ASN-category blocking as an explanation — both Reality and CDN-fronted
+  fail on it the same way (connects, zero traffic, active close), a pattern
+  most consistent with protocol-level DPI rather than either of those two
+  mechanisms specifically. Whether TLS interception or proxy-only egress are
+  *also* present is still unknown, but they're no longer the leading
+  hypothesis for why nothing works — the confirmed Xray/V2Ray protocol block
+  (§1) already explains the observed failure without needing them.
 - Whether Reality is detectable in ways not yet public. The Iranian reports are
-  suggestive but are community threads, not measurement studies.
+  suggestive but are community threads, not measurement studies. The
+  2026-08-31 result is now a data point in favour of "yes, detectable" for
+  this specific filter, though it doesn't isolate *which* detection
+  mechanism DET is using.
 - How long browser-fingerprint mimicry stays sufficient as composite
   fingerprinting (TLS + OS + ALPN + HTTP/2 settings) spreads. Not our problem
   at school-filter scale, but it is the direction of travel.
+- **New, 2026-08-31:** what DET's DPI is actually keying on — App-ID
+  signature match on the VLESS/Xray wire format, a TLS behavioural
+  fingerprint, or something else. Distinguishing these needs a packet
+  capture taken from on the school network (Tier 3 item 13, still not done)
+  and is the natural next investigation if the project continues down the
+  protocol-obfuscation path rather than pivoting to proxy chaining.

@@ -247,6 +247,64 @@ DET is already confirmed to block Xray/V2Ray protocol clients outright (see
 transport path, and Cloudflare-fronted DNS are not evidence this works
 against the actual filter. Only testing on the real network answers that.
 
+**That test happened, 2026-08-31 — see below.**
+
+---
+
+## The real-network test, 2026-08-31 — the measurement that outranked everything
+
+**Confirmed on the school's own Wi-Fi (DET NSW, Palo Alto filtering), not
+inferred:**
+
+- **Reality**: Karing showed "Connected," 17 connections registered, 49
+  seconds of run time — but **0 bytes transferred in either direction**. A
+  direct browser request to `api.ipify.org` failed with
+  `ERR_CONNECTION_CLOSED`.
+- **CDN-fronted (MHS-CDN)**: same pattern — connections registering, then
+  settling at 0B/0B. A direct browser request to `canva.com` also failed
+  with `ERR_CONNECTION_CLOSED`.
+
+**Both paths fail identically, and the failure shape is itself informative.**
+`ERR_CONNECTION_CLOSED` is an *active* close, not a timeout — consistent
+with the network accepting the initial TCP/TLS handshake and then a DPI layer
+recognizing and killing the connection once real protocol traffic starts,
+rather than a blanket IP/port block (which would more likely just hang or
+refuse at connect time). This matches — and is now direct, first-hand
+confirmation of — the DET Xray/V2Ray protocol-block finding already on
+record (§1 below): the filter appears to be killing the *protocol*, not just
+the destination, and CDN-fronting the same protocol through Cloudflare
+doesn't change that outcome.
+
+**On a separate, non-school network (personal hotspot) tested the same
+session, for comparison:** Reality worked completely normally (real
+bidirectional traffic, 1.7MB↑/611KB↓). The CDN-fronted profile showed a
+distinct, different problem — upload succeeded but download never arrived
+(confirmed not a DET-specific issue, since this was off the school network
+entirely). Investigated and fixed same-day: the Worker's WebSocket handler
+assumed `event.data` was always an `ArrayBuffer`, but Cloudflare Workers
+delivers binary WebSocket messages as a `Blob` — casting a `Blob` directly to
+`Uint8Array` silently produces 0 bytes with no error, so every client message
+was being discarded before it ever reached the TCP write to the VM. Fixed by
+awaiting `Blob.arrayBuffer()` before conversion, with writes chained through
+a queue to preserve byte-stream order (the async Blob read means writes can
+no longer be fired synchronously in arrival order). Verified with a
+controlled test (a hand-built, valid VLESS request sent directly over WS,
+bypassing Karing entirely): before the fix, 0 of 870 expected response bytes
+arrived; after, all 870 arrived correctly, matching a control test against
+Xray directly on the VM (bypassing Cloudflare entirely) byte-for-byte. **Not
+yet re-verified on the school network itself** — the fix is proven correct
+on a clean network, not proven to change the DET outcome, since the DET
+failure looks like protocol-level DPI interference that would very plausibly
+affect the fixed Worker identically.
+
+**What this settles:** the single biggest open question in this project —
+whether anything here works from inside the actual school network — has an
+answer, and it's no, for both paths, in the same way. This doesn't necessarily
+mean the project is at a dead end; it means Tier 2's remaining idea (outbound
+proxy chaining through the school's own proxy, if one exists) or a
+fundamentally different disguise strategy are now the only avenues the
+roadmap hasn't already tried, and neither has been attempted.
+
 ---
 
 ## Immediate next actions
@@ -255,13 +313,21 @@ against the actual filter. Only testing on the real network answers that.
    connected, and verified carrying real traffic to the VM.
 2. ~~Stage 5, human step~~ — **done**. Cloudflare account authorized, Worker
    built and deployed, second Xray inbound live, transport path verified
-   end-to-end. Not yet tested through a real Xray client, and — per the
-   DET/Xray-V2Ray-block finding — its effectiveness against the actual filter
-   is unverified regardless.
-3. **The school-network test** — see below. Now the single most important
-   remaining item: both client paths (Reality direct, and the new
-   CDN-fronted profile) can be tested in one session, since a working TUN-mode client
-   exists for the first time this project has had one.
+   end-to-end, a real bug found and fixed same-day (Blob handling).
+3. ~~The school-network test~~ — **done, 2026-08-31**. Both paths fail
+   identically on DET's network (connects, zero data flows, active
+   `ERR_CONNECTION_CLOSED`), while both work on other networks. See above.
+4. **Decide the next architectural move.** The roadmap's remaining untried
+   options are outbound proxy chaining through the school's own proxy (if
+   DET runs an explicit-proxy-only egress — unconfirmed) and TLS
+   interception handling (also unconfirmed whether DET does this). Neither
+   has been investigated. This is a decision for the project owner, not
+   something to pick autonomously — see
+   [stealth-roadmap.md](stealth-roadmap.md) §4 Tier 2 item 11.
+5. Re-verify the CDN-fronted fix through an actual Karing session (not just
+   the controlled non-Karing test used to confirm the fix) — lower priority
+   now that both paths are known to fail on the actual target network
+   regardless.
 
 ---
 
@@ -288,21 +354,21 @@ replacement; `limitations.md` §9 — reconciled; WireGuard — retired.
 
 ---
 
-## The measurement that outranks everything
+## The measurement that outranked everything — done, 2026-08-31
 
-Nothing in this project has been tested on the school network. Whether the
-filter does TLS interception, proxy-only egress, or ASN-category blocking is
-**pure speculation** right now, and those are the three things most likely to
-defeat the current design. This session added two concrete facts, both
-recorded permanently in [stealth-roadmap.md](stealth-roadmap.md) §1: DET's
-Palo Alto filter blocks Cloudflare WARP by name, and — more seriously — **DET
-NSW blocks Xray/V2Ray-core protocol clients outright**, which is
-protocol-level detection, not just destination-reputation. Neither of these
-is a substitute for the real test; if anything, the second one raises the
-priority of that test above the Tier 1/2 work, since it questions whether
-Reality's core "indistinguishable handshake" premise holds against this
-specific filter at all.
+This section used to say nothing had been tested on the school network and
+that this was pure speculation. That's no longer true — see "The
+real-network test" above for the full result. Short version: both Reality
+and the CDN-fronted path connect and then carry **zero traffic** on DET's
+network, with a direct browser request actively closed rather than timing
+out — consistent with, and now first-hand confirmation of, DET's confirmed
+protocol-level Xray/V2Ray block (§1 in the roadmap). Whether DET also does
+TLS interception or proxy-only egress specifically is still not directly
+observed (the failure looks like DPI killing the protocol before those would
+even become relevant), so those remain open, lower-priority questions.
 
-One session on that network answers all three. If a session is running on the
-Mac while connected to that network, that test takes priority over every other
-item here.
+The next thing this project needs is not more building on the current
+architecture — it's a decision from the project owner on which untried
+direction to pursue (proxy chaining, a different disguise strategy, or
+accepting the current limits), since both paths this project has built now
+have a real, measured answer on the network that matters.
