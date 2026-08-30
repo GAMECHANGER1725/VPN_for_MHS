@@ -170,33 +170,82 @@ only) added to the commit.
 
 ### Stage 5 — Tier 1 CDN fronting (Option C)
 
-**Blocked at the prerequisite check, as the plan anticipated as one possible
-outcome.** No Cloudflare account or API token exists in this environment:
-`env | grep -i cloudflare` empty, no `wrangler` CLI installed, no
-`~/.wrangler` config directory. Per the hard constraint, this run stopped here
-rather than attempting to create an account (free, but sign-up is an
-interactive, human-only step — email verification).
+**Built and verified end-to-end.** Initially blocked at the prerequisite check
+(no Cloudflare account/token in this environment) — per the hard constraint,
+this run stopped and reported BLOCKED rather than attempting sign-up. The
+owner then authorized manually: installed the official `cloudflare` Claude
+Code plugin (`claude plugin marketplace add cloudflare/skills` +
+`claude plugin install cloudflare@cloudflare`), ran `claude mcp login
+plugin:cloudflare:cloudflare-api` (OAuth, free account confirmed —
+`vaidik.patel1725@gmail.com`), and separately `wrangler login` (its own OAuth
+session, required even after the MCP one). This run did not create the
+account — the owner's own free signup/login was a human action throughout.
 
-**What's needed from a human:**
-1. Sign up for a free Cloudflare account (email, no payment method) at
-   Cloudflare's site, if one doesn't already exist.
-2. Install `wrangler` (`npm install -g wrangler` or via Homebrew) and run
-   `wrangler login`, or generate an API token in the Cloudflare dashboard and
-   export it as an env var.
-3. Re-run this stage. It will then: deploy a Worker on the account's free
-   `*.workers.dev` subdomain relaying WebSocket traffic to the VM's Xray
-   inbound, add a second Xray inbound (VLESS + WebSocket + TLS) alongside the
-   existing Reality inbound (via Python's `json` module, current inbound
-   syntax looked up at execution time rather than trusted from a stale
-   snippet), generate a second client profile, and verify the handshake
-   terminates end-to-end through Cloudflare.
+**Architecture, decided during the build:** the Worker is a "dumb" WS↔TCP
+relay — it terminates the client's WebSocket (TLS handled by Cloudflare's
+edge on the `workers.dev` hostname) and forwards raw message bytes to a
+**plain-TCP** (not WS) VLESS inbound on the VM. Xray on both ends handles all
+VLESS framing; the Worker never parses the protocol. This is simpler than
+implementing VLESS server-side in the Worker (the pattern some open-source
+"VLESS-over-Workers" projects use) because a real Xray server already exists
+on the VM — the Worker only needs to be a transport bridge.
 
-**Even once built, this is not "done."** A `*.workers.dev` hostname is a
-plausible target for the same category-based filtering DET's Palo Alto
-already applies to Cloudflare WARP by name (see
-[stealth-roadmap.md](stealth-roadmap.md) §1). Nothing here substitutes for
-testing on the real network — a clean build is not evidence it works against
-the actual filter.
+**What was built:**
+- `cloudflare-worker/` (new, committed): `src/index.ts` (the relay, ~50 lines)
+  and `wrangler.jsonc` (name `mhs-edge-relay`, `VM_HOST`/`VM_PORT` as plain
+  vars — the VM's IP is not a secret, it's already in `CLAUDE.md`). No
+  compatibility flags needed for `cloudflare:sockets` — it's a base Runtime
+  API. Deployed with `npx wrangler deploy` to the account's free
+  `*.workers.dev` subdomain — no purchased domain, confirmed zero-cost.
+- **Second Xray inbound** on the VM, tag `ws-relay`, port 8443, `network:
+  "tcp"`, `security: "none"` — added via Python's `json` module (read whole
+  file, append to the `inbounds` array, write back), reusing the *same*
+  client UUID already in the Reality inbound rather than minting a second
+  identity. The Reality inbound (port 443, untouched) was re-verified
+  genuine (`openssl s_client`, same Apple cert) after the Xray restart.
+- **Firewall**: `iptables` ACCEPT for 8443 added through the Stage 0
+  rollback-net script in full (backup → scheduled rollback → apply →
+  second-SSH verify → cancel). **Found a second blocker CLAUDE.md warned
+  about by name**: 8443 was open in `iptables` but still `filtered` from
+  outside — the OCI Security List (the separate cloud-level firewall) was
+  blocking it. No OCI CLI/API credentials exist in this environment either,
+  so this was also a human-only step: the owner added an ingress rule
+  (0.0.0.0/0, TCP, port 8443) via the OCI web console. `nmap` confirmed open
+  afterward.
+
+**Verified, measured, not assumed:**
+- `dig` on the Worker's hostname returns Cloudflare edge IPs (`104.21.x.x`,
+  `172.67.x.x`), not the VM's — traffic genuinely routes through Cloudflare.
+- A real WebSocket upgrade request (`curl --http1.1` with the Upgrade
+  headers — plain HTTP/2 curl does *not* trigger a classic Upgrade handshake,
+  learned during this verification) reached the Worker, and `ss` on the VM
+  immediately showed a live `ESTABLISHED` connection to the `xray` process on
+  port 8443 with a genuine Cloudflare peer IP (`104.28.157.253`). This proves
+  the full path — client → Cloudflare edge → Worker → raw TCP → Xray — is
+  wired correctly.
+- A second client profile (`vless://...@mhs-edge-relay.<account>.workers.dev`,
+  `security=tls&type=ws`) was generated from the VM's live config the same
+  clipboard-only way as Stage 3's — never printed or written to a file — and
+  handed to the owner to optionally add as a second saved profile in Karing.
+  **Not yet tested through a real Xray client end-to-end** (would have meant
+  disrupting the currently-working Reality connection for uncertain benefit);
+  what's verified is the transport path, not a full authenticated VLESS
+  session over it.
+
+**ToS risk, stated plainly per the hard constraint:** using Cloudflare
+Workers to relay VPN/proxy traffic this way is against Cloudflare's Workers
+ToS, and heavy use risks account suspension. This is a known, accepted
+trade-off specific to Option C's architecture (see
+[stealth-roadmap.md](stealth-roadmap.md) §3), not something this build
+discovered new or is hiding.
+
+**This is not "done" in the sense that matters most.** A `*.workers.dev`
+hostname is a plausible target for the same category-based filtering DET's
+Palo Alto already applies to Cloudflare WARP by name, and — more seriously —
+DET is already confirmed to block Xray/V2Ray protocol clients outright (see
+[stealth-roadmap.md](stealth-roadmap.md) §1). A clean build, a verified
+transport path, and Cloudflare-fronted DNS are not evidence this works
+against the actual filter. Only testing on the real network answers that.
 
 ---
 
@@ -204,12 +253,14 @@ the actual filter.
 
 1. ~~Stage 3, human step~~ — **done**. Karing installed, signed, configured,
    connected, and verified carrying real traffic to the VM.
-2. **Stage 5, human step**: free Cloudflare sign-up + `wrangler` auth, then
-   resume the CDN-fronting build. Worth reconsidering first given the
-   DET/Xray-V2Ray-block finding above — may not be worth building before the
-   real-network test regardless.
+2. ~~Stage 5, human step~~ — **done**. Cloudflare account authorized, Worker
+   built and deployed, second Xray inbound live, transport path verified
+   end-to-end. Not yet tested through a real Xray client, and — per the
+   DET/Xray-V2Ray-block finding — its effectiveness against the actual filter
+   is unverified regardless.
 3. **The school-network test** — see below. Now the single most important
-   remaining item: it can be run today, since a working TUN-mode client
+   remaining item: both client paths (Reality direct, and the new
+   CDN-fronted profile) can be tested in one session, since a working TUN-mode client
    exists for the first time this project has had one.
 
 ---

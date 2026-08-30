@@ -47,3 +47,8 @@ reports/*
 *.tmp
 *.swp
 .vpn-doctor-cache/
+
+# Cloudflare Worker build tooling — reproducible from package.json
+cloudflare-worker/node_modules/
+cloudflare-worker/.wrangler/
+.cloudflare-worker-scratch/

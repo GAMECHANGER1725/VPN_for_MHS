@@ -1,0 +1,13 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "mhs-edge-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-30",
+  "vars": {
+    "VM_HOST": "137.23.22.149",
+    "VM_PORT": "8443"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

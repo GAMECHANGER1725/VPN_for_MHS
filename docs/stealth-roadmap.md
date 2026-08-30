@@ -256,11 +256,19 @@ live in the same cloud/ASN as our VM, so the SNI↔IP join stops being anomalous
   oversight.
 
 **Decision made (owner call, 2026-08-30):** Option C, as a **second Xray
-inbound alongside the existing Reality inbound** — not a replacement. See
-[session-state.md](session-state.md) for build status; as of this date it is
-**blocked** on there being no Cloudflare account/API token available in this
-environment (free to create, but sign-up is an interactive, human-only step —
-not something an autonomous run should do on the owner's behalf).
+inbound alongside the existing Reality inbound** — not a replacement. **Built
+and verified 2026-08-30** — see [session-state.md](session-state.md) for the
+full build record. Initially blocked on there being no Cloudflare
+account/token in this environment (correctly, per the hard rule against
+autonomous sign-up); the owner then authorized manually (plugin install +
+OAuth), and the rest — Worker deployment, second Xray inbound, firewall
+opening on both layers (iptables and, newly discovered, the OCI Security
+List) — proceeded. The Worker is a dumb WS↔TCP relay, not a VLESS
+implementation in JS: it terminates WebSocket+TLS at Cloudflare's edge and
+forwards raw bytes to a **plain-TCP** Xray inbound on the VM, since a real
+Xray server already exists there. Transport path verified end-to-end (a
+genuine Cloudflare IP observed connecting straight into the `xray` process on
+the VM); not yet exercised through a full real-client VLESS session.
 
 **Assessment:** Option C is the strongest answer to the threat model we
 actually face, and the weakest answer to the project's founding principle of
@@ -338,10 +346,14 @@ See [session-state.md](session-state.md) for exact verification evidence.
 
 ### Tier 2 — Build a second, differently-shaped path.
 
-10. Stand up a second inbound so the client has two profiles to switch between.
-    The natural second shape is CDN-fronted (Option C), because it fails
-    differently from Reality: it survives IP-reputation blocking and
-    proxy-only egress, which Reality does not.
+10. ~~Stand up a second inbound so the client has two profiles to switch
+    between.~~ **Done 2026-08-30** — CDN-fronted (Option C) is live as a
+    second inbound; see §3 above and [session-state.md](session-state.md).
+    Chosen because it fails differently from Reality: it survives
+    IP-reputation blocking and proxy-only egress, which Reality does not. It
+    inherits an open question Reality doesn't have to answer, though: whether
+    it also survives the protocol-level Xray/V2Ray block DET is confirmed to
+    run (§1) — untested.
 11. If TLS interception turns out to be present on the target network,
     configure Xray outbound chaining through the school's own proxy. Do not
     build this speculatively — test first.
